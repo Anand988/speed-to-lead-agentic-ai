@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build Outputs & Caches
+.next/
+dist/
+build/
+.turbo/
+
+# Environment & Local Configuration
+.env
+.env.local
+.env*.local
+
+# OS Files
+.DS_Store
+Thumbs.db
