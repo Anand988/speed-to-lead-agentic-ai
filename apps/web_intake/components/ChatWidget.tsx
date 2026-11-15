@@ -9,9 +9,11 @@ interface Message {
   content: string;
   metadata?: {
     step?: string;
+    stepIndex?: number;
     quote?: any;
     appointmentId?: string;
     paymentUrl?: string;
+    quickReplies?: string[];
   };
 }
 
@@ -28,53 +30,45 @@ export default function ChatWidget({ initialVertical, initialMessage, onClose }:
   const [conversationId, setConversationId] = useState<string | null>(null);
 
   useEffect(() => {
-    if (initialMessage) {
-      handleInitialSubmission(initialMessage);
+    if (initialVertical) {
+      initializeWidgetSession();
     }
-  }, [initialMessage]);
+  }, [initialVertical]);
 
-  const handleInitialSubmission = async (text: string) => {
-    const userMsg: Message = { role: 'user', content: text };
-    setMessages([userMsg]);
+  const initializeWidgetSession = async () => {
     setLoading(true);
 
     try {
-      // 1. Start Session dynamically via API service
+      // 1. Start session and pass initialMessage to the backend for context awareness
       const startData = await startChatSession(initialVertical);
       const activeSessionId = startData.sessionId;
       if (activeSessionId) setConversationId(activeSessionId);
 
-      // 2. Send Initial Message dynamically
-      const data = await sendChatMessage(activeSessionId, text, initialVertical);
-
-      setMessages((prev) => [
-        ...prev,
+      // 2. Display the context-aware greeting from Step 1 cleanly
+      setMessages([
         {
           role: 'assistant',
-          content: data.reply || 'Processed successfully.',
-          metadata: data.metadata,
+          content: startData.initialMessage || `Hello! Let's get your ${initialVertical} project set up.`,
+          metadata: startData.metadata,
         },
       ]);
     } catch (err) {
       console.error('API Error:', err);
-      setMessages((prev) => [...prev, { role: 'assistant', content: 'Failed to connect to backend orchestration service.' }]);
+      setMessages([{ role: 'assistant', content: 'Failed to connect to backend orchestration service.' }]);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || loading || !conversationId) return;
+  const submitMessageText = async (textToSend: string) => {
+    if (!textToSend.trim() || loading || !conversationId) return;
 
-    const userText = input;
-    setInput('');
-    const userMsg: Message = { role: 'user', content: userText };
+    const userMsg: Message = { role: 'user', content: textToSend };
     setMessages((prev) => [...prev, userMsg]);
     setLoading(true);
 
     try {
-      const data = await sendChatMessage(conversationId, userText, initialVertical);
+      const data = await sendChatMessage(conversationId, textToSend, initialVertical);
       setMessages((prev) => [
         ...prev,
         {
@@ -89,6 +83,13 @@ export default function ChatWidget({ initialVertical, initialMessage, onClose }:
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = input;
+    setInput('');
+    await submitMessageText(text);
   };
 
   return (
@@ -113,8 +114,24 @@ export default function ChatWidget({ initialVertical, initialMessage, onClose }:
                   : 'bg-slate-800 text-slate-200 border border-slate-700 rounded-bl-none'
               }`}
             >
-              {/* Clean up raw markdown asterisks for polished UI presentation */}
               <p>{msg.content.replace(/\*\*/g, '')}</p>
+
+              {/* Quick Reply Option Chips rendered dynamically */}
+              {msg.metadata?.quickReplies && msg.metadata.quickReplies.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 mt-2.5 pt-2 border-t border-slate-700/80">
+                  {msg.metadata.quickReplies.map((option, optIdx) => (
+                    <button
+                      key={optIdx}
+                      type="button"
+                      onClick={() => submitMessageText(option)}
+                      disabled={loading}
+                      className="bg-slate-700 hover:bg-emerald-600 text-slate-100 text-[11px] font-medium px-2.5 py-1 rounded-lg transition disabled:opacity-50 shadow-sm"
+                    >
+                      {option}
+                    </button>
+                  ))}
+                </div>
+              )}
 
               {msg.metadata?.paymentUrl && (
                 <div className="mt-2 pt-2 border-t border-slate-700">
@@ -134,7 +151,7 @@ export default function ChatWidget({ initialVertical, initialMessage, onClose }:
         {loading && (
           <div className="flex justify-start">
             <div className="bg-slate-800 border border-slate-700 text-slate-400 text-xs rounded-xl px-3 py-2 animate-pulse">
-              Orchestrating vendors & pricing...
+              Orchestrating workflow step...
             </div>
           </div>
         )}

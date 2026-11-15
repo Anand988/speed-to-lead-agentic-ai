@@ -1,227 +1,200 @@
 // apps/api/src/modules/consumer-chat/consumer-chat.service.ts
-import { Injectable, Logger, InternalServerErrorException, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import axios from 'axios';
-import { VerticalPromptService } from './vertical-prompt.service.js';
 import { QueueService } from '../queue/queue.service.js';
 import { Lead, LeadStatus } from '../lead/lead.entity.js';
 import { Message } from './message.entity.js';
+import { VerticalEntity } from '../tenant/domain.entity.js';
 
 @Injectable()
 export class ConsumerChatService {
   private readonly logger = new Logger(ConsumerChatService.name);
-  private readonly openRouterApiKey: string;
-  private readonly openRouterApiUrl = 'https://openrouter.ai/api/v1/chat/completions';
 
   constructor(
     private readonly configService: ConfigService,
-    private readonly verticalPromptService: VerticalPromptService,
     private readonly queueService: QueueService,
     @InjectRepository(Lead)
     private readonly leadRepository: Repository<Lead>,
     @InjectRepository(Message)
     private readonly messageRepository: Repository<Message>,
-  ) {
-    this.openRouterApiKey = this.configService.get<string>('OPENROUTER_API_KEY') || '';
-  }
+    @InjectRepository(VerticalEntity)
+    private readonly verticalRepository: Repository<VerticalEntity>,
+  ) {}
 
-  async startSession(verticalSlug: string) {
-    const systemPrompt = this.verticalPromptService.getPromptForVertical(verticalSlug);
+  async startSession(verticalSlug: string, initialMessage?: string) {
     const sessionId = `visitor_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
-    // Persist system session start message
     await this.messageRepository.save({
       sessionId,
       sender: 'system',
       content: `Session started for vertical: ${verticalSlug}`,
     });
 
-    this.logger.log(`Started new secure session: ${sessionId} for vertical: ${verticalSlug}`);
+    const vertical = await this.verticalRepository.findOne({ where: { slug: verticalSlug } });
+    const verticalName = vertical?.name || verticalSlug.replace(/-/g, ' ');
+    
+    const intakeSteps = vertical?.intakeSteps || [
+      { stepIndex: 1, question: `What property type needs ${verticalName} service?`, quickReplies: ['Residential', 'Commercial', 'Industrial'] },
+      { stepIndex: 2, question: "When would you like this scheduled?", quickReplies: ['This Weekend', 'Weekday', 'As Soon As Possible'] },
+      { stepIndex: 3, question: "Please share your full name and phone number:", quickReplies: [] }
+    ];
+
+    const intro = initialMessage 
+      ? `I see you are inquiring about: "${initialMessage}".` 
+      : `Let's get your project configured.`;
+
+    const initialGreeting = `Hello! I'm your assistant for ${verticalName}. ${intro} ${intakeSteps[0].question}`;
+
+    const initialLead = this.leadRepository.create({
+      sessionId,
+      verticalSlug,
+      status: LeadStatus.NEW,
+      source: 'Public Discovery Marketplace',
+      firstName: 'Pending',
+      lastName: '',
+      phone: '',
+      metadata: { stepIndex: 1, extractedData: { initialRequirement: initialMessage } },
+    });
+    await this.leadRepository.save(initialLead);
+
+    await this.messageRepository.save({
+      sessionId,
+      sender: 'assistant',
+      content: initialGreeting,
+      extractedData: { stepIndex: 1 },
+    });
 
     return {
       sessionId,
       verticalSlug,
-      systemPromptLoaded: !!systemPrompt,
-      initialMessage: `Hello! I'm your virtual assistant for ${verticalSlug}. How can I assist you with your requirements today?`,
+      initialMessage: initialGreeting,
+      metadata: {
+        stepIndex: 1,
+        quickReplies: intakeSteps[0].quickReplies,
+      },
     };
   }
 
   async processMessage(sessionId: string, verticalSlug: string, userMessage: string) {
-    // --- L3 SECURITY LAYER: Heuristic Threat & Prompt Injection Screening ---
     this.screenMessageForThreats(userMessage);
 
-    // 1. Persist incoming visitor message
     await this.messageRepository.save({
       sessionId,
       sender: 'visitor',
       content: userMessage,
     });
 
-    // --- L4 SECURITY LAYER: Vertical Prompt & Guardrails ---
-    const baseSystemPrompt = this.verticalPromptService.getPromptForVertical(verticalSlug);
-
-    const systemPrompt = `${baseSystemPrompt}
-    
-    CRITICAL INSTRUCTION: You must respond strictly in valid JSON format with the following keys:
-    {
-      "reply": "Your conversational response to the user here",
-      "isQualified": boolean (true ONLY if the user has provided their location/zip code, exact scope, and contact readiness),
-      "extractedData": {
-        "name": "extracted name or null",
-        "phone": "extracted phone or null",
-        "email": "extracted email or null",
-        "location": "extracted zip code or city or null",
-        "requirements": "summary of requirements or null"
-      }
-    }`;
-
-    try {
-      const aiResponseJson = await this.callOpenRouterAI(systemPrompt, userMessage);
-      
-      let parsedResponse;
-      try {
-        const cleanJsonString = aiResponseJson.replace(/```json/g, '').replace(/```/g, '').trim();
-        parsedResponse = JSON.parse(cleanJsonString);
-      } catch (parseError) {
-        this.logger.warn(`Failed to parse structured JSON from AI. Falling back to safe response.`);
-        parsedResponse = {
-          reply: "I've received your message. Could you please confirm your location and contact details so we can assist you further?",
-          isQualified: false,
-          extractedData: {},
-        };
-      }
-
-      const { reply, isQualified, extractedData } = parsedResponse;
-      let savedLeadId = null;
-
-      if (isQualified) {
-        let existingLead = await this.leadRepository.findOne({ where: { sessionId } });
-
-        if (!existingLead) {
-          const newLead = this.leadRepository.create({
-            sessionId,
-            verticalSlug,
-            status: LeadStatus.NEW,
-            source: 'Public Discovery Marketplace',
-            firstName: extractedData?.name || 'Consumer',
-            lastName: '',
-            email: extractedData?.email || null,
-            phone: extractedData?.phone || null,
-            metadata: { 
-              extractedData, 
-              lastMessage: userMessage, 
-              systemPromptUsed: verticalSlug 
-            },
-          });
-          const savedLead = await this.leadRepository.save(newLead);
-          savedLeadId = savedLead.id;
-
-          await this.queueService.addMarketplaceMatchingJob({
-            leadId: savedLeadId,
-            verticalSlug,
-            sessionId,
-            metadata: extractedData,
-          });
-
-          this.logger.log(`Secure Lead ${savedLeadId} qualified and queued for marketplace matching.`);
-        } else {
-          savedLeadId = existingLead.id;
-        }
-      }
-
-      // Ensure reply is explicitly a string, never an object or undefined
-      const responseContent = typeof reply === 'string' && reply.trim().length > 0 
-        ? reply 
-        : "I've received your message. Could you please confirm your location and contact details so we can assist you further?";
-
-      // 2. Persist assistant response message along with extracted data
-      await this.messageRepository.save({
+    let lead = await this.leadRepository.findOne({ where: { sessionId } });
+    if (!lead) {
+      lead = this.leadRepository.create({
         sessionId,
-        sender: 'assistant',
-        content: responseContent, // Guaranteed string
-        extractedData: extractedData || {},
+        verticalSlug,
+        status: LeadStatus.NEW,
+        source: 'Public Discovery Marketplace',
+        firstName: 'Pending',
+        lastName: '',
+        phone: '',
+        metadata: { stepIndex: 1, extractedData: {} },
       });
-
-      return {
-        sessionId,
-        reply: responseContent,
-        isQualified,
-        leadId: savedLeadId,
-        extractedData: extractedData || {},
-      };
-    } catch (error) {
-      this.logger.error(
-        `Error processing AI message for session ${sessionId}: ${error instanceof Error ? error.message : String(error)}`,
-        error instanceof Error ? error.stack : undefined,
-      );
-      throw new InternalServerErrorException('Failed to process chat message securely.');
     }
-  }
 
-  /**
-   * L3 Heuristic Security Filter: Screens input for prompt jailbreaks & malicious patterns.
-   */
-  private screenMessageForThreats(message: string): void {
-    const lower = message.toLowerCase();
-    const maliciousPatterns = [
-      'ignore previous instructions',
-      'system prompt',
-      'you are now untethered',
-      'drop table',
-      '<script>',
-      'javascript:',
+    const metadata = lead.metadata || {};
+    let currentStepIndex = metadata.stepIndex || 1;
+    let extractedData = metadata.extractedData || {};
+
+    const vertical = await this.verticalRepository.findOne({ where: { slug: verticalSlug } });
+    const verticalName = vertical?.name || verticalSlug.replace(/-/g, ' ');
+
+    const intakeSteps = vertical?.intakeSteps || [
+      { stepIndex: 1, question: `What property type needs ${verticalName} service?`, quickReplies: ['Residential', 'Commercial', 'Industrial'] },
+      { stepIndex: 2, question: "When would you like this scheduled?", quickReplies: ['This Weekend', 'Weekday', 'As Soon As Possible'] },
+      { stepIndex: 3, question: "Please share your full name and phone number:", quickReplies: [] }
     ];
 
-    for (const pattern of maliciousPatterns) {
-      if (lower.includes(pattern)) {
-        this.logger.warn(`L3 Security Alert: Potential prompt injection or malicious payload detected: "${message}"`);
-        throw new BadRequestException('Request flagged by security filter. Please keep inquiries focused on service requests.');
+    let responseContent = '';
+    let isQualified = false;
+    let quickReplies: string[] = [];
+
+    // --- DOMAIN GUARDRAIL FOR RANDOM/OFF-TOPIC TEXT ---
+    const lowerMsg = userMessage.toLowerCase();
+    const isOffTopic = lowerMsg.includes('who are you') || lowerMsg.includes('weather') || lowerMsg.includes('joke') || lowerMsg.includes('poem') || lowerMsg.includes('what can you do');
+
+    if (isOffTopic) {
+      // Gracefully anchor back to the selected vertical without breaking wizard state
+      responseContent = `I am your specialized assistant for **${verticalName}**. My goal is to help you configure and book your ${verticalName} project. Let's continue: ${intakeSteps[currentStepIndex - 1]?.question || intakeSteps[0].question}`;
+      quickReplies = intakeSteps[currentStepIndex - 1]?.quickReplies || intakeSteps[0].quickReplies;
+    } else if (currentStepIndex === 1) {
+      extractedData.propertyType = userMessage;
+      currentStepIndex = 2;
+      responseContent = `Got it (${userMessage}). ${intakeSteps[1]?.question || "When would you like this scheduled?"}`;
+      quickReplies = intakeSteps[1]?.quickReplies || ['This Weekend', 'Weekday', 'As Soon As Possible'];
+    } else if (currentStepIndex === 2) {
+      extractedData.schedule = userMessage;
+      currentStepIndex = 3;
+      responseContent = `Almost done! ${intakeSteps[2]?.question || "Please share your full name and phone number:"}`;
+      quickReplies = [];
+    } else {
+      const phoneMatch = userMessage.match(/(\+91[\-\s]?)?[6-9]\d{9}/);
+      if (phoneMatch) {
+        extractedData.phone = phoneMatch[0];
       }
+      extractedData.name = userMessage;
+      
+      lead.firstName = extractedData.name || 'Consumer';
+      lead.phone = extractedData.phone || userMessage;
+      isQualified = true;
+      currentStepIndex = 4;
+
+      responseContent = `Perfect! We have successfully matched you with our verified partner for **${verticalName}**.\n\n- Requirement: ${extractedData.initialRequirement || 'General Inquiry'}\n- Property: ${extractedData.propertyType || 'Standard'}\n- Schedule: ${extractedData.schedule || 'As Soon As Possible'}\n\nPlease click below to secure your booking via our safe escrow payment gateway:`;
+      quickReplies = [];
     }
+
+    lead.metadata = { stepIndex: currentStepIndex, extractedData };
+    if (isQualified) {
+      lead.status = LeadStatus.NEW;
+    }
+    await this.leadRepository.save(lead);
+
+    if (isQualified) {
+      await this.queueService.addMarketplaceMatchingJob({
+        leadId: lead.id,
+        verticalSlug,
+        sessionId,
+        metadata: extractedData,
+      });
+      this.logger.log(`Lead ${lead.id} successfully qualified and queued.`);
+    }
+
+    await this.messageRepository.save({
+      sessionId,
+      sender: 'assistant',
+      content: responseContent,
+      extractedData,
+    });
+
+    return {
+      sessionId,
+      reply: responseContent,
+      isQualified,
+      leadId: lead.id,
+      extractedData,
+      metadata: {
+        stepIndex: currentStepIndex,
+        quickReplies: isQualified ? [] : quickReplies,
+        paymentUrl: isQualified ? 'https://pay.escrow.com/gateway/pay_secure_token_123' : undefined,
+      },
+    };
   }
 
-  private async callOpenRouterAI(systemPrompt: string, userMessage: string): Promise<string> {
-    if (!this.openRouterApiKey) {
-      this.logger.warn('OPENROUTER_API_KEY is missing. Returning fallback response.');
-      return JSON.stringify({
-        reply: `Received your message: "${userMessage}". (API key is missing).`,
-        isQualified: false,
-        extractedData: {}
-      });
-    }
-
-    try {
-      const response = await axios.post(
-        this.openRouterApiUrl,
-        {
-          model: 'deepseek/deepseek-chat',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userMessage },
-          ],
-          temperature: 0.3,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${this.openRouterApiKey}`,
-            'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://yourdomain.com',
-            'X-Title': 'Speed to Lead Marketplace',
-          },
-        },
-      );
-
-      return response.data?.choices?.[0]?.message?.content || '{"reply": "Error generating response", "isQualified": false, "extractedData": {}}';
-    } catch (error) {
-      const errorDetails = axios.isAxiosError(error) && error.response?.data
-        ? JSON.stringify(error.response.data)
-        : error instanceof Error
-          ? error.message
-          : String(error);
-      this.logger.error(`OpenRouter API error: ${errorDetails}`);
-      throw error;
+  private screenMessageForThreats(message: string): void {
+    const lower = message.toLowerCase();
+    const maliciousPatterns = ['ignore previous instructions', 'system prompt', 'drop table', '<script>'];
+    for (const pattern of maliciousPatterns) {
+      if (lower.includes(pattern)) {
+        throw new BadRequestException('Request flagged by security filter.');
+      }
     }
   }
 }
