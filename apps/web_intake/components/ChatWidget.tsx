@@ -40,18 +40,27 @@ export default function ChatWidget({ initialVertical, initialMessage, onClose }:
 
     try {
       // 1. Start session and pass initialMessage to the backend for context awareness
-      const startData = await startChatSession(initialVertical);
+      const startData = await startChatSession(initialVertical, initialMessage);
       const activeSessionId = startData.sessionId;
       if (activeSessionId) setConversationId(activeSessionId);
 
-      // 2. Display the context-aware greeting from Step 1 cleanly
-      setMessages([
-        {
-          role: 'assistant',
-          content: startData.initialMessage || `Hello! Let's get your ${initialVertical} project set up.`,
-          metadata: startData.metadata,
-        },
-      ]);
+      // 2. Build initial message history: User's typed requirement first, then assistant's greeting
+      const initialChatHistory: Message[] = [];
+
+      if (initialMessage && initialMessage.trim().length > 0) {
+        initialChatHistory.push({
+          role: 'user',
+          content: initialMessage.trim(),
+        });
+      }
+
+      initialChatHistory.push({
+        role: 'assistant',
+        content: startData.initialMessage || `Hello! Let's get your ${initialVertical} project set up.`,
+        metadata: startData.metadata,
+      });
+
+      setMessages(initialChatHistory);
     } catch (err) {
       console.error('API Error:', err);
       setMessages([{ role: 'assistant', content: 'Failed to connect to backend orchestration service.' }]);

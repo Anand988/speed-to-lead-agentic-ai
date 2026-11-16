@@ -35,6 +35,7 @@ export class ConsumerChatService {
     const vertical = await this.verticalRepository.findOne({ where: { slug: verticalSlug } });
     const verticalName = vertical?.name || verticalSlug.replace(/-/g, ' ');
     
+    // Unified intake steps for ALL verticals (including solar)
     const intakeSteps = vertical?.intakeSteps || [
       { stepIndex: 1, question: `What property type needs ${verticalName} service?`, quickReplies: ['Residential', 'Commercial', 'Industrial'] },
       { stepIndex: 2, question: "When would you like this scheduled?", quickReplies: ['This Weekend', 'Weekday', 'As Soon As Possible'] },
@@ -104,6 +105,20 @@ export class ConsumerChatService {
     let currentStepIndex = metadata.stepIndex || 1;
     let extractedData = metadata.extractedData || {};
 
+    // --- MEMORY PERSISTENCE: ATOMIC CAPTURE OF CONTACT INFO ---
+    const phoneMatch = userMessage.match(/(\+91[\-\s]?)?[6-9]\d{9}/);
+    if (phoneMatch) {
+      extractedData.phone = phoneMatch[0];
+    }
+    
+    // Capture name if provided or if we are at step 3
+    if (currentStepIndex === 3 && !extractedData.name && !phoneMatch) {
+      extractedData.name = userMessage.trim();
+    } else if (userMessage.toLowerCase().includes('name is')) {
+      const parts = userMessage.split(/is/i);
+      if (parts[1]) extractedData.name = parts[1].trim();
+    }
+
     const vertical = await this.verticalRepository.findOne({ where: { slug: verticalSlug } });
     const verticalName = vertical?.name || verticalSlug.replace(/-/g, ' ');
 
@@ -117,13 +132,12 @@ export class ConsumerChatService {
     let isQualified = false;
     let quickReplies: string[] = [];
 
-    // --- DOMAIN GUARDRAIL FOR RANDOM/OFF-TOPIC TEXT ---
+    // --- DOMAIN GUARDRAIL FOR OFF-TOPIC TEXT ---
     const lowerMsg = userMessage.toLowerCase();
-    const isOffTopic = lowerMsg.includes('who are you') || lowerMsg.includes('weather') || lowerMsg.includes('joke') || lowerMsg.includes('poem') || lowerMsg.includes('what can you do');
+    const isOffTopic = lowerMsg.includes('weather') || lowerMsg.includes('joke') || lowerMsg.includes('poem') || lowerMsg.includes('what can you do');
 
     if (isOffTopic) {
-      // Gracefully anchor back to the selected vertical without breaking wizard state
-      responseContent = `I am your specialized assistant for **${verticalName}**. My goal is to help you configure and book your ${verticalName} project. Let's continue: ${intakeSteps[currentStepIndex - 1]?.question || intakeSteps[0].question}`;
+      responseContent = `I am your specialized assistant for **${verticalName}**. Let's stay focused on your project: ${intakeSteps[currentStepIndex - 1]?.question || intakeSteps[0].question}`;
       quickReplies = intakeSteps[currentStepIndex - 1]?.quickReplies || intakeSteps[0].quickReplies;
     } else if (currentStepIndex === 1) {
       extractedData.propertyType = userMessage;
@@ -136,19 +150,28 @@ export class ConsumerChatService {
       responseContent = `Almost done! ${intakeSteps[2]?.question || "Please share your full name and phone number:"}`;
       quickReplies = [];
     } else {
-      const phoneMatch = userMessage.match(/(\+91[\-\s]?)?[6-9]\d{9}/);
-      if (phoneMatch) {
-        extractedData.phone = phoneMatch[0];
+      // If we have both name & phone (or captured via message), finalize qualification
+      if (extractedData.phone || phoneMatch) {
+        extractedData.phone = extractedData.phone || phoneMatch?.[0];
       }
-      extractedData.name = userMessage;
-      
+      if (!extractedData.name) {
+        extractedData.name = userMessage;
+      }
+
       lead.firstName = extractedData.name || 'Consumer';
-      lead.phone = extractedData.phone || userMessage;
+      lead.phone = extractedData.phone || 'Pending';
       isQualified = true;
       currentStepIndex = 4;
 
-      responseContent = `Perfect! We have successfully matched you with our verified partner for **${verticalName}**.\n\n- Requirement: ${extractedData.initialRequirement || 'General Inquiry'}\n- Property: ${extractedData.propertyType || 'Standard'}\n- Schedule: ${extractedData.schedule || 'As Soon As Possible'}\n\nPlease click below to secure your booking via our safe escrow payment gateway:`;
+      responseContent = `Thank you, ${lead.firstName}! We have successfully logged your request for **${verticalName}**.\n\n- Requirement: ${extractedData.initialRequirement || 'General Inquiry'}\n- Property Type: ${extractedData.propertyType || 'Standard'}\n- Schedule: ${extractedData.schedule || 'Flexible'}\n- Contact Phone: ${lead.phone}\n\nPlease click below to secure your booking via our safe escrow payment gateway:`;
       quickReplies = [];
+    }
+
+    // If contact info is already present at step 3, auto-advance to qualification
+    if (currentStepIndex === 3 && extractedData.phone && extractedData.name) {
+      isQualified = true;
+      currentStepIndex = 4;
+      responseContent = `Thank you, ${extractedData.name}! We have all your details for **${verticalName}**.\n\nPlease proceed via our secure escrow payment gateway:`;
     }
 
     lead.metadata = { stepIndex: currentStepIndex, extractedData };

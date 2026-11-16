@@ -1,5 +1,5 @@
 // apps/api/src/modules/chat/chat.controller.ts
-import { Controller, Post, Body, Req } from '@nestjs/common';
+import { Controller, Post, Get, Param, Body, Req } from '@nestjs/common';
 import { ChatService } from './chat.service.js';
 
 @Controller('api/v1/consumer/chat')
@@ -8,14 +8,15 @@ export class ChatController {
 
   @Post('start')
   async startSession(
-    @Body() body: { verticalSlug?: string; tenantId?: string },
+    @Body() body: { verticalSlug?: string; tenantId?: string; initialMessage?: string },
     @Req() req: any,
   ) {
     const userId = req.user?.id || 'anonymous-user';
     const vertical = body.verticalSlug || 'Solar Panel Installation';
     const tenantId = body.tenantId;
+    const initialMessage = body.initialMessage;
 
-    return await this.chatService.createSession(userId, vertical, tenantId);
+    return await this.chatService.createSession(userId, vertical, tenantId, initialMessage);
   }
 
   @Post('message')
@@ -36,5 +37,10 @@ export class ChatController {
       vertical,
       tenantId,
     );
+  }
+
+  @Get('history/:sessionId')
+  async getHistory(@Param('sessionId') sessionId: string) {
+    return await this.chatService.getSessionHistory(sessionId);
   }
 }
