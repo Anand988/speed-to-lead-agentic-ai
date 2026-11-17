@@ -5,12 +5,14 @@ import { ChatController } from './chat.controller.js';
 import { ChatService } from './chat.service.js';
 import { Lead } from '../lead/lead.entity.js';
 import { Message } from '../consumer-chat/message.entity.js';
-import { VerticalEntity } from '../tenant/domain.entity.js';
+import { VerticalEntity } from '../tenant/entities/domain.entity.js';
+import { BusinessEntity } from '../tenant/entities/business.entity.js';
+import { ServiceEntity } from '../tenant/entities/service.entity.js';
 import { QueueModule } from '../queue/queue.module.js';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Lead, Message, VerticalEntity]),
+    TypeOrmModule.forFeature([Lead, Message, VerticalEntity, BusinessEntity, ServiceEntity]),
     QueueModule,
   ],
   controllers: [ChatController],

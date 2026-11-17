@@ -6,7 +6,7 @@ import { Repository } from 'typeorm';
 import { QueueService } from '../queue/queue.service.js';
 import { Lead, LeadStatus } from '../lead/lead.entity.js';
 import { Message } from './message.entity.js';
-import { VerticalEntity } from '../tenant/domain.entity.js';
+import { VerticalEntity } from '../tenant/entities/domain.entity.js';
 
 @Injectable()
 export class ConsumerChatService {

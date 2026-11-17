@@ -5,7 +5,9 @@ import { Repository } from 'typeorm';
 import { QueueService } from '../queue/queue.service.js';
 import { Lead, LeadStatus } from '../lead/lead.entity.js';
 import { Message } from '../consumer-chat/message.entity.js';
-import { VerticalEntity } from '../tenant/domain.entity.js';
+import { VerticalEntity } from '../tenant/entities/domain.entity.js';
+import { BusinessEntity } from '../tenant/entities/business.entity.js';
+import { ServiceEntity } from '../tenant/entities/service.entity.js';
 
 @Injectable()
 export class ChatService {
@@ -19,7 +21,29 @@ export class ChatService {
     private readonly messageRepository: Repository<Message>,
     @InjectRepository(VerticalEntity)
     private readonly verticalRepository: Repository<VerticalEntity>,
+    @InjectRepository(BusinessEntity)
+    private readonly businessRepository: Repository<BusinessEntity>,
+    @InjectRepository(ServiceEntity)
+    private readonly serviceRepository: Repository<ServiceEntity>,
   ) {}
+
+  private async getVerticalIntakeSteps(verticalSlug: string, verticalName: string) {
+    const vertical = await this.verticalRepository.findOne({ where: { slug: verticalSlug } });
+    if (vertical && vertical.intakeSteps && vertical.intakeSteps.length > 0) {
+      return vertical.intakeSteps;
+    }
+
+    // Default Fallback with Intent Forking (Step 1)
+    return [
+      {
+        stepIndex: 1,
+        question: `Welcome! I am your technical advisor for ${verticalName}. How can we assist you today?\n\n• **Plan New Installation**: Configure a custom system and book an on-site survey.\n• **Repair & Maintenance**: Request servicing, troubleshooting, or repairs.\n• **Explore Procedure & Costs**: Understand technical roadmaps and ROI first.`,
+        quickReplies: ['Plan New Installation', 'Repair & Maintenance', 'Explore Procedure & Costs'],
+      },
+      { stepIndex: 2, question: `Please share your locality/area (e.g., Hanamkonda, Warangal):`, quickReplies: ['Hanamkonda', 'Warangal', 'Secunderabad'] },
+      { stepIndex: 3, question: `Please share your full name and 10-digit mobile phone number:`, quickReplies: [] },
+    ];
+  }
 
   async createSession(userId: string, verticalSlug: string, tenantId?: string, initialMessage?: string) {
     const sessionId = `visitor_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
@@ -32,23 +56,11 @@ export class ChatService {
 
     const vertical = await this.verticalRepository.findOne({ where: { slug: verticalSlug } });
     const verticalName = vertical?.name || verticalSlug.replace(/-/g, ' ');
-    
-    // 4-Step Consultative Intake Flow (Property Type -> Priority/Scope -> Schedule -> Name & Phone)
-    const intakeSteps = vertical?.intakeSteps || [
-      { stepIndex: 1, question: `What property type needs ${verticalName} service?`, quickReplies: ['Residential', 'Commercial', 'Industrial'] },
-      { stepIndex: 2, question: "What is your main priority or specific requirement for this project?", quickReplies: ['Perimeter Security', 'Surveillance & Cameras', 'Access Control', 'Full System Customization'] },
-      { stepIndex: 3, question: "When would you like this scheduled for a consultation?", quickReplies: ['This Weekend', 'Weekday', 'As Soon As Possible'] },
-      { stepIndex: 4, question: "Please share your full name and phone number:", quickReplies: [] }
-    ];
+    const intakeSteps = await this.getVerticalIntakeSteps(verticalSlug, verticalName);
 
     const cleanedInitialMsg = initialMessage && initialMessage.trim().length > 0 ? initialMessage.trim() : null;
-    
     if (cleanedInitialMsg) {
-      await this.messageRepository.save({
-        sessionId,
-        sender: 'visitor',
-        content: cleanedInitialMsg,
-      });
+      await this.messageRepository.save({ sessionId, sender: 'visitor', content: cleanedInitialMsg });
     }
 
     const initialGreeting = `Hello! I'm your assistant for ${verticalName}. Let's get your project configured. ${intakeSteps[0].question}`;
@@ -77,10 +89,7 @@ export class ChatService {
       verticalSlug,
       initialMessage: initialGreeting,
       userInitialMessage: cleanedInitialMsg,
-      metadata: {
-        stepIndex: 1,
-        quickReplies: intakeSteps[0].quickReplies,
-      },
+      metadata: { stepIndex: 1, quickReplies: intakeSteps[0].quickReplies },
     };
   }
 
@@ -115,105 +124,118 @@ export class ChatService {
 
     const vertical = await this.verticalRepository.findOne({ where: { slug: verticalSlug } });
     const verticalName = vertical?.name || verticalSlug.replace(/-/g, ' ');
-
-    const intakeSteps = vertical?.intakeSteps || [
-      { stepIndex: 1, question: `What property type needs ${verticalName} service?`, quickReplies: ['Residential', 'Commercial', 'Industrial'] },
-      { stepIndex: 2, question: "What is your main priority or specific requirement for this project?", quickReplies: ['Perimeter Security', 'Surveillance & Cameras', 'Access Control', 'Full System Customization'] },
-      { stepIndex: 3, question: "When would you like this scheduled for a consultation?", quickReplies: ['This Weekend', 'Weekday', 'As Soon As Possible'] },
-      { stepIndex: 4, question: "Please share your full name and phone number:", quickReplies: [] }
-    ];
+    const intakeSteps = await this.getVerticalIntakeSteps(verticalSlug, verticalName);
+    const maxSteps = intakeSteps.length;
 
     let responseContent = '';
     let isQualified = false;
     let quickReplies: string[] = [];
+    const lowerMsg = userMessage.toLowerCase().trim();
 
     const phoneMatch = userMessage.match(/(\+91[\-\s]?)?[6-9]\d{9}/);
     if (phoneMatch) {
       extractedData.phone = phoneMatch[0];
     }
 
-    const lowerMsg = userMessage.toLowerCase().trim();
-
-    // --- 4-STEP CONSULTATIVE STATE-MACHINE FLOW ---
+    // --- MARKETPLACE STATE MACHINE WORKFLOW ---
     if (currentStepIndex === 1) {
-      const validKeywords = ['residential', 'commercial', 'industrial', 'home', 'house', 'office', 'factory', 'apartment', 'building'];
-      const isValid = validKeywords.some(kw => lowerMsg.includes(kw));
-
-      if (!isValid) {
-        responseContent = `Sorry! We are unable to understand your query. ${intakeSteps[0].question}`;
-        quickReplies = intakeSteps[0].quickReplies;
+      // Step 1: Intent Forking
+      if (lowerMsg.includes('repair') || lowerMsg.includes('maintenance')) {
+        extractedData.intent = 'Repair & Maintenance';
+      } else if (lowerMsg.includes('explore') || lowerMsg.includes('procedure') || lowerMsg.includes('cost')) {
+        extractedData.intent = 'Explorer';
+        responseContent = `I'd be glad to walk you through the procedures, approvals, and technical roadmaps! Whenever you feel ready to configure a project, let me know.`;
+        quickReplies = ['Plan New Installation', 'Repair & Maintenance'];
+        lead.metadata = { stepIndex: currentStepIndex, extractedData };
+        await this.leadRepository.save(lead);
+        await this.messageRepository.save({ sessionId: activeSessionId, sender: 'assistant', content: responseContent, extractedData });
+        return { sessionId: activeSessionId, reply: responseContent, isQualified: false, leadId: lead.id, extractedData, metadata: { stepIndex: currentStepIndex, quickReplies } };
       } else {
-        extractedData.propertyType = userMessage;
-        currentStepIndex = 2;
-        responseContent = `Got it (${userMessage}). ${intakeSteps[1].question}`;
-        quickReplies = intakeSteps[1].quickReplies;
+        extractedData.intent = 'New Installation';
       }
-    } else if (currentStepIndex === 2) {
-      // Step 2: Priority / Scoping Question (Accepts any descriptive answer or quick reply)
-      if (userMessage.length < 2) {
-        responseContent = `Sorry! We are unable to understand your query. ${intakeSteps[1].question}`;
-        quickReplies = intakeSteps[1].quickReplies;
-      } else {
-        extractedData.priority = userMessage;
-        currentStepIndex = 3;
-        responseContent = `Understood. ${intakeSteps[2].question}`;
-        quickReplies = intakeSteps[2].quickReplies;
-      }
-    } else if (currentStepIndex === 3) {
-      // Step 3: Schedule
-      const validSchedule = ['weekend', 'weekday', 'soon', 'asap', 'tomorrow', 'today', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday', 'flexible', 'morning', 'evening'];
-      const isValid = validSchedule.some(s => lowerMsg.includes(s));
 
-      if (!isValid) {
-        responseContent = `Sorry! We are unable to understand your query. ${intakeSteps[2].question}`;
-        quickReplies = intakeSteps[2].quickReplies;
+      currentStepIndex = 2;
+      responseContent = `Understood (${extractedData.intent}). To find certified specialists near you, what is your locality or area (e.g., Hanamkonda, Warangal)?`;
+      quickReplies = ['Hanamkonda', 'Warangal', 'Secunderabad'];
+    } 
+    else if (currentStepIndex === 2) {
+      // Step 2: Locality Capture & Local Business Listing Query
+      extractedData.locality = userMessage;
+      currentStepIndex = 3;
+
+      // Query verified local businesses in this locality offering this vertical
+      const localBusinesses = await this.businessRepository.find({
+        where: { verticalSlug, locality: userMessage, isActive: true },
+        relations: { services: true },
+      });
+
+      if (localBusinesses.length > 0) {
+        extractedData.availableBusinesses = localBusinesses;
+        responseContent = `Here are the top-rated certified providers in **${userMessage}** for **${verticalName}**. Please select a provider to view their service packages:`;
+        quickReplies = localBusinesses.map((b) => b.name);
       } else {
-        extractedData.schedule = userMessage;
+        // Fallback if no local vendor registered in that exact locality
+        responseContent = `We are expanding our network in ${userMessage}! Let's collect your requirements so our regional partner can reach out. ${intakeSteps[1]?.question || 'Please share your details:'}`;
+        quickReplies = intakeSteps[1]?.quickReplies || [];
+      }
+    } 
+    else if (currentStepIndex === 3 && extractedData.availableBusinesses) {
+      // Step 3: Vendor Selection & Service Menu Display
+      const selectedVendor = extractedData.availableBusinesses.find(
+        (b: BusinessEntity) => b.name.toLowerCase() === lowerMsg || b.name.toLowerCase().includes(lowerMsg)
+      );
+
+      if (!selectedVendor) {
+        responseContent = `Please select a valid provider from the list provided below:`;
+        quickReplies = extractedData.availableBusinesses.map((b: BusinessEntity) => b.name);
+      } else {
+        extractedData.selectedBusinessId = selectedVendor.id;
+        extractedData.selectedBusinessName = selectedVendor.name;
         currentStepIndex = 4;
-        responseContent = `Almost done! ${intakeSteps[3].question}`;
+
+        const serviceList = selectedVendor.services.map((s: ServiceEntity) => `• **${s.name}**${s.basePrice ? ` (₹${s.basePrice})` : ''}`).join('\n');
+        responseContent = `You selected **${selectedVendor.name}** (${selectedVendor.rating}★). Their available service packages:\n\n${serviceList}\n\nPlease select your preferred service package:`;
+        quickReplies = selectedVendor.services.map((s: ServiceEntity) => s.name);
+      }
+    } 
+    else if (currentStepIndex === 4 && extractedData.selectedBusinessId) {
+      // Step 4: Service Package Selection & Final Contact Prompt
+      extractedData.selectedService = userMessage;
+      currentStepIndex = 5;
+
+      responseContent = `Almost done! Please share your full name and 10-digit mobile phone number so **${extractedData.selectedBusinessName}** can coordinate your booking:`;
+      quickReplies = [];
+    } 
+    else {
+      // Step 5: Name & Phone Parsing and Final Qualification
+      let cleanName = '';
+      if (userMessage.includes(',')) {
+        const parts = userMessage.split(',');
+        cleanName = parts[0].replace(/name[:\s]*/gi, '').trim();
+      } else {
+        const nameMatch = userMessage.match(/(?:name[:\s]*)([a-zA-Z\s]+)(?:[,;\n]|$)/i) || userMessage.match(/^([a-zA-Z\s]{2,30})$/);
+        if (nameMatch) {
+          cleanName = (nameMatch[1] || nameMatch[0]).replace(/phone|number|[:,\-\s0-9]/gi, '').trim();
+        }
+      }
+
+      if (cleanName && cleanName.length > 1) {
+        extractedData.name = cleanName;
+      } else if (!extractedData.name && !phoneMatch && userMessage.length > 2) {
+        extractedData.name = userMessage.replace(/[:,-]/g, ' ').trim();
+      }
+
+      if (extractedData.name && extractedData.phone) {
+        lead.firstName = extractedData.name;
+        lead.phone = extractedData.phone;
+        isQualified = true;
+        currentStepIndex = 6;
+
+        responseContent = `Thank you, ${lead.firstName}! Your booking with **${extractedData.selectedBusinessName || 'our certified partner'}** has been successfully logged.\n\n- Vertical: ${verticalName}\n- Intent: ${extractedData.intent}\n- Locality: ${extractedData.locality}\n- Selected Service: ${extractedData.selectedService || 'Standard Package'}\n- Contact Phone: ${lead.phone}\n\nThe provider's specialist will reach out to you shortly.`;
         quickReplies = [];
-      }
-    } else {
-      // Step 4: Name & Phone Collection (NO PAYMENT - Consultation Confirmation Only)
-      if (phoneMatch) {
-        extractedData.phone = phoneMatch[0];
-      }
-
-      if (extractedData.name && !extractedData.phone) {
-        if (phoneMatch) {
-          extractedData.phone = phoneMatch[0];
-          lead.firstName = extractedData.name;
-          lead.phone = extractedData.phone;
-          isQualified = true;
-          currentStepIndex = 5;
-
-          responseContent = `Thank you, ${lead.firstName}! We have successfully logged your consultation request for **${verticalName}**.\n\n- Requirement: ${extractedData.initialRequirement || 'General Inquiry'}\n- Property Type: ${extractedData.propertyType || 'Standard'}\n- Priority Scope: ${extractedData.priority || 'General Assessment'}\n- Preferred Schedule: ${extractedData.schedule || 'Flexible'}\n- Contact Phone: ${lead.phone}\n\nOur expert consultant will review your requirements and reach out to you shortly to discuss custom solutions.`;
-          quickReplies = [];
-        } else {
-          responseContent = `Sorry! We are unable to understand your query. Please provide your valid 10-digit mobile phone number:`;
-          quickReplies = [];
-        }
-      } else if (!extractedData.name) {
-        const isQuestionOrJunk = lowerMsg.startsWith('who') || lowerMsg.startsWith('what') || lowerMsg.startsWith('how') || lowerMsg.length < 2 || lowerMsg.includes('bot');
-        
-        if (isQuestionOrJunk) {
-          responseContent = `Sorry! We are unable to understand your query. ${intakeSteps[3].question}`;
-          quickReplies = [];
-        } else {
-          extractedData.name = userMessage;
-          if (!extractedData.phone) {
-            responseContent = `Thanks, ${extractedData.name}. Could you also please provide your 10-digit mobile phone number?`;
-            quickReplies = [];
-          } else {
-            lead.firstName = extractedData.name;
-            lead.phone = extractedData.phone;
-            isQualified = true;
-            currentStepIndex = 5;
-
-            responseContent = `Thank you, ${lead.firstName}! We have successfully logged your consultation request for **${verticalName}**.\n\n- Requirement: ${extractedData.initialRequirement || 'General Inquiry'}\n- Property Type: ${extractedData.propertyType || 'Standard'}\n- Priority Scope: ${extractedData.priority || 'General Assessment'}\n- Preferred Schedule: ${extractedData.schedule || 'Flexible'}\n- Contact Phone: ${lead.phone}\n\nOur expert consultant will review your requirements and reach out to you shortly to discuss custom solutions.`;
-            quickReplies = [];
-          }
-        }
+      } else {
+        responseContent = `Please provide your full name and valid 10-digit mobile phone number to confirm your booking:`;
+        quickReplies = [];
       }
     }
 
@@ -248,7 +270,6 @@ export class ChatService {
       metadata: {
         stepIndex: currentStepIndex,
         quickReplies: isQualified ? [] : quickReplies,
-        // Payment gateway URL removed entirely as requested
       },
     };
   }

@@ -12,12 +12,13 @@ export class VerticalEntity {
   @Column()
   name: string; // e.g., 'Home Cleaning & Makeover'
 
-  @Column('jsonb', { nullable: true })
-  intakeSteps: {
+  /// Stores the in-depth, naive-user-friendly steps as JSON
+  @Column({ type: 'jsonb', nullable: true })
+  intakeSteps: Array<{
     stepIndex: number;
     question: string;
     quickReplies: string[];
-  }[];
+  }>;
 
   @CreateDateColumn()
   createdAt: Date;
