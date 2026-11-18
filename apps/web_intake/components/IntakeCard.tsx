@@ -1,24 +1,48 @@
+// components/IntakeCard.tsx
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 
 interface IntakeCardProps {
   onStartChat: (vertical: string, message: string) => void;
   disabled: boolean;
 }
 
-export default function IntakeCard({ onStartChat, disabled }: IntakeCardProps) {
-  // 👉 Updated service domains/verticals
-  const serviceDomains = [
-    'Solar Panel Installation',
-    'Home Cleaning & Maintenance',
-    'EV Charger Setup',
-    'HVAC Repair & Servicing',
-    'Smart Home Security Integration',
-  ];
+interface Vertical {
+  id: string;
+  slug: string;
+  name: string;
+}
 
-  const [selectedVertical, setSelectedVertical] = useState(serviceDomains[0]);
+export default function IntakeCard({ onStartChat, disabled }: IntakeCardProps) {
+  const [serviceDomains, setServiceDomains] = useState<Vertical[]>([]);
+  const [selectedVertical, setSelectedVertical] = useState<string>('');
   const [userMessage, setUserMessage] = useState('');
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    // Fetch verticals dynamically from the backend database API
+    async function fetchVerticals() {
+      try {
+        // In IntakeCard.tsx (Line ~27)
+        const res = await fetch('http://localhost:3000/api/verticals'); // Replace 3000 with your actual NestJS backend port
+        
+        if (res.ok) {
+          const data = await res.json();
+          const verticals = Array.isArray(data) ? data : data.verticals || [];
+          setServiceDomains(verticals);
+          if (verticals.length > 0) {
+            setSelectedVertical(verticals[0].name);
+          }
+        }
+      } catch (err) {
+        console.error('Failed to fetch verticals from database', err);
+      } finally {
+        setLoading(false);
+      }
+    }
+    fetchVerticals();
+  }, []);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -35,21 +59,26 @@ export default function IntakeCard({ onStartChat, disabled }: IntakeCardProps) {
 
       <form onSubmit={handleSubmit} className="space-y-5">
         <div>
-          {/* 👉 Updated label text here */}
           <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
             Select a service type
           </label>
           <select
             value={selectedVertical}
             onChange={(e) => setSelectedVertical(e.target.value)}
-            disabled={disabled}
+            disabled={disabled || loading}
             className="w-full px-4 py-3 rounded-xl border border-slate-700 bg-slate-900 text-slate-100 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 transition"
           >
-            {serviceDomains.map((domain) => (
-              <option key={domain} value={domain}>
-                {domain}
-              </option>
-            ))}
+            {loading ? (
+              <option>Loading services...</option>
+            ) : serviceDomains.length === 0 ? (
+              <option>No services available</option>
+            ) : (
+              serviceDomains.map((domain) => (
+                <option key={domain.id || domain.slug} value={domain.name}>
+                  {domain.name}
+                </option>
+              ))
+            )}
           </select>
         </div>
 
@@ -61,7 +90,7 @@ export default function IntakeCard({ onStartChat, disabled }: IntakeCardProps) {
             rows={3}
             value={userMessage}
             onChange={(e) => setUserMessage(e.target.value)}
-            placeholder="e.g., Looking for a 5kW residential solar setup in Kondapur..."
+            placeholder="e.g., Looking for a 5kW residential solar setup in Hanamkonda..."
             disabled={disabled}
             className="w-full px-4 py-3 rounded-xl border border-slate-700 bg-slate-900 text-slate-100 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 transition resize-none"
           />
@@ -69,7 +98,7 @@ export default function IntakeCard({ onStartChat, disabled }: IntakeCardProps) {
 
         <button
           type="submit"
-          disabled={disabled}
+          disabled={disabled || loading}
           className="w-full py-3.5 px-4 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-semibold rounded-xl shadow-lg shadow-emerald-900/20 transition duration-200 disabled:opacity-50 flex items-center justify-center gap-2"
         >
           <span>Start Chat Session</span>

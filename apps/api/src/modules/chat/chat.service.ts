@@ -1,7 +1,7 @@
 // apps/api/src/modules/chat/chat.service.ts
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, ILike } from 'typeorm';
 import { QueueService } from '../queue/queue.service.js';
 import { Lead, LeadStatus } from '../lead/lead.entity.js';
 import { Message } from '../consumer-chat/message.entity.js';
@@ -27,26 +27,80 @@ export class ChatService {
     private readonly serviceRepository: Repository<ServiceEntity>,
   ) {}
 
-  private async getVerticalIntakeSteps(verticalSlug: string, verticalName: string) {
-    const vertical = await this.verticalRepository.findOne({ where: { slug: verticalSlug } });
-    if (vertical && vertical.intakeSteps && vertical.intakeSteps.length > 0) {
-      return vertical.intakeSteps;
-    }
-
-    // Default Fallback with Intent Forking (Step 1)
-    return [
-      {
-        stepIndex: 1,
-        question: `Welcome! I am your technical advisor for ${verticalName}. How can we assist you today?\n\n• **Plan New Installation**: Configure a custom system and book an on-site survey.\n• **Repair & Maintenance**: Request servicing, troubleshooting, or repairs.\n• **Explore Procedure & Costs**: Understand technical roadmaps and ROI first.`,
-        quickReplies: ['Plan New Installation', 'Repair & Maintenance', 'Explore Procedure & Costs'],
-      },
-      { stepIndex: 2, question: `Please share your locality/area (e.g., Hanamkonda, Warangal):`, quickReplies: ['Hanamkonda', 'Warangal', 'Secunderabad'] },
-      { stepIndex: 3, question: `Please share your full name and 10-digit mobile phone number:`, quickReplies: [] },
-    ];
+  // Helper method to get formatted IST timestamp string
+  private getIstTimestampString(): string {
+    return new Date().toLocaleString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    });
   }
 
-  async createSession(userId: string, verticalSlug: string, tenantId?: string, initialMessage?: string) {
+  // Inside chat.service.ts (Entity Extraction / Intent Parser Helper)
+  private extractIntentAndLocality(message: string, availableLocalities: string[]) {
+    const lowerMsg = message.toLowerCase();
+    let intent = null;
+    let locality = null;
+
+    // 1. Map keywords to intents
+    if (lowerMsg.includes('repair') || lowerMsg.includes('maintenance') || lowerMsg.includes('service') || lowerMsg.includes('troubleshoot') || lowerMsg.includes('cleaning') || lowerMsg.includes('dispatch')) {
+      intent = 'Repair & Maintenance';
+    } else if (lowerMsg.includes('install') || lowerMsg.includes('setup') || lowerMsg.includes('new') || lowerMsg.includes('buy') || lowerMsg.includes('panel')) {
+      intent = 'Plan New Installation';
+    } else if (lowerMsg.includes('cost') || lowerMsg.includes('price') || lowerMsg.includes('procedure') || lowerMsg.includes('roi') || lowerMsg.includes('subsidy')) {
+      intent = 'Explore Procedure & Costs';
+    }
+
+    // 2. Match locality from database list
+    const matchedLocality = availableLocalities.find(loc => lowerMsg.includes(loc.toLowerCase()));
+    if (matchedLocality) {
+      locality = matchedLocality;
+    }
+
+    return { intent, locality };
+  }
+
+  private extractEntities(message: string, currentData: any = {}) {
+    const lower = message.toLowerCase();
+    const updated = { ...currentData };
+
+    // 1. Intent Extraction (Priority given to explicit Installation keywords first)
+    if (lower.includes('install') || lower.includes('new installation') || lower.includes('setup')) {
+      updated.intent = 'New Installation';
+    } else if (lower.includes('repair') || lower.includes('maintenance') || lower.includes('damaged') || lower.includes('fix') || lower.includes('troubleshoot')) {
+      updated.intent = 'Repair & Maintenance';
+    } else if (lower.includes('explore') || lower.includes('procedure') || lower.includes('cost') || lower.includes('subsidy') || lower.includes('roi')) {
+      updated.intent = 'Explorer';
+    } else if (lower.includes('service') || lower.includes('issue')) {
+      updated.intent = 'Repair & Maintenance';
+    }
+
+    // 2. System Size Extraction (e.g., 5kW or 5kv typo)
+    const kwMatch = message.match(/(\d+)\s*(?:kw|kv|kilowatt)/i);
+    if (kwMatch) {
+      updated.systemSize = `${kwMatch[1]}kW`;
+    }
+
+    // 3. Phone Extraction
+    const phoneMatch = message.match(/(\+91[\-\s]?)?[6-9]\d{9}/);
+    if (phoneMatch) {
+      updated.phone = phoneMatch[0];
+    }
+
+    // 4. Free-form Locality Capture
+    if (!updated.locality && message.trim().length > 2 && !phoneMatch && !lower.includes('repair') && !lower.includes('install')) {
+      if (updated.intent && !updated.selectedBusinessId) {
+        updated.locality = message.trim();
+      }
+    }
+
+    return updated;
+  }
+
+  async createSession(userId: string, rawVerticalSlug: string, tenantId?: string, initialMessage?: string) {
+    const verticalSlug = rawVerticalSlug.toLowerCase().trim().replace(/\s+/g, '-');
     const sessionId = `visitor_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    const istTimeStr = this.getIstTimestampString();
 
     await this.messageRepository.save({
       sessionId,
@@ -54,16 +108,36 @@ export class ChatService {
       content: `Session started for vertical: ${verticalSlug}`,
     });
 
+    // 1. Fetch available localities dynamically from database businesses for this vertical
+    const businesses = await this.businessRepository.find({ where: { verticalSlug } });
+    const dbLocalities = Array.from(new Set(businesses.map(b => b.locality)));
+
     const vertical = await this.verticalRepository.findOne({ where: { slug: verticalSlug } });
     const verticalName = vertical?.name || verticalSlug.replace(/-/g, ' ');
-    const intakeSteps = await this.getVerticalIntakeSteps(verticalSlug, verticalName);
 
     const cleanedInitialMsg = initialMessage && initialMessage.trim().length > 0 ? initialMessage.trim() : null;
+    let extractedData: any = { tenantId };
+    
+    let initialGreeting = `Hello! I'm your assistant for **${verticalName}**. How can we assist you today?\n\n• **Plan New Installation**: Configure a custom system and book an on-site survey.\n• **Repair & Maintenance**: Request servicing, troubleshooting, or repairs.\n• **Explore Procedure & Costs**: Understand technical roadmaps and ROI first.\n\n*(IST: ${istTimeStr})*`;
+    let quickReplies = ['Plan New Installation', 'Repair & Maintenance', 'Explore Procedure & Costs'];
+
     if (cleanedInitialMsg) {
       await this.messageRepository.save({ sessionId, sender: 'visitor', content: cleanedInitialMsg });
+      
+      const extracted = this.extractIntentAndLocality(cleanedInitialMsg, dbLocalities);
+      extractedData.intent = extracted.intent || extractedData.intent;
+      extractedData.locality = extracted.locality || extractedData.locality;
     }
 
-    const initialGreeting = `Hello! I'm your assistant for ${verticalName}. Let's get your project configured. ${intakeSteps[0].question}`;
+    let initialState = 'GREETING';
+    if (extractedData.intent && extractedData.locality) {
+      initialState = 'VENDOR_SELECTION';
+      initialGreeting = `Got it! You are looking for **${extractedData.intent}** in **${extractedData.locality}**. Here are the verified local service providers available near you:\n\n*(IST: ${istTimeStr})*`;
+    } else if (extractedData.intent) {
+      initialState = 'LOCALITY_PENDING';
+      quickReplies = dbLocalities.length > 0 ? dbLocalities : [];
+      initialGreeting = `Understood (**${extractedData.intent}**). Please select or share your locality where service is required:\n\n*(IST: ${istTimeStr})*`;
+    }
 
     const initialLead = this.leadRepository.create({
       sessionId,
@@ -73,7 +147,7 @@ export class ChatService {
       firstName: 'Pending',
       lastName: '',
       phone: '',
-      metadata: { stepIndex: 1, extractedData: { initialRequirement: cleanedInitialMsg || 'General Inquiry' } },
+      metadata: { state: initialState, extractedData },
     });
     await this.leadRepository.save(initialLead);
 
@@ -81,7 +155,7 @@ export class ChatService {
       sessionId,
       sender: 'assistant',
       content: initialGreeting,
-      extractedData: { stepIndex: 1 },
+      extractedData,
     });
 
     return {
@@ -89,188 +163,153 @@ export class ChatService {
       verticalSlug,
       initialMessage: initialGreeting,
       userInitialMessage: cleanedInitialMsg,
-      metadata: { stepIndex: 1, quickReplies: intakeSteps[0].quickReplies },
+      metadata: { state: initialState, quickReplies },
     };
   }
 
-  async processMessage(userId: string, sessionId: string | null, userMessage: string, verticalSlug: string, tenantId?: string) {
-    const activeSessionId = sessionId || `visitor_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  async processMessage(sessionId: string, userMessage: string) {
+    const lead = await this.leadRepository.findOne({ where: { sessionId } });
+    if (!lead) throw new Error(`Session ${sessionId} not found`);
 
     this.screenMessageForThreats(userMessage);
 
-    await this.messageRepository.save({
-      sessionId: activeSessionId,
-      sender: 'visitor',
-      content: userMessage,
-    });
-
-    let lead = await this.leadRepository.findOne({ where: { sessionId: activeSessionId } });
-    if (!lead) {
-      lead = this.leadRepository.create({
-        sessionId: activeSessionId,
-        verticalSlug,
-        status: LeadStatus.NEW,
-        source: 'Public Discovery Marketplace',
-        firstName: 'Pending',
-        lastName: '',
-        phone: '',
-        metadata: { stepIndex: 1, extractedData: { tenantId } },
-      });
-    }
-
     const metadata = lead.metadata || {};
-    let currentStepIndex = metadata.stepIndex || 1;
-    let extractedData = metadata.extractedData || {};
+    const extractedData = metadata.extractedData || {};
+    let currentState = metadata.state || 'DISCOVERY';
+    const istTimeStr = this.getIstTimestampString();
 
-    const vertical = await this.verticalRepository.findOne({ where: { slug: verticalSlug } });
-    const verticalName = vertical?.name || verticalSlug.replace(/-/g, ' ');
-    const intakeSteps = await this.getVerticalIntakeSteps(verticalSlug, verticalName);
-    const maxSteps = intakeSteps.length;
+    // 1. Save visitor message
+    await this.messageRepository.save({ sessionId, sender: 'visitor', content: userMessage });
 
-    let responseContent = '';
-    let isQualified = false;
-    let quickReplies: string[] = [];
     const lowerMsg = userMessage.toLowerCase().trim();
+    let assistantReply = '';
 
-    const phoneMatch = userMessage.match(/(\+91[\-\s]?)?[6-9]\d{9}/);
+    // 2. HARD LOCK: If session is already completed, do not re-process
+    if (currentState === 'COMPLETED' || lead.status === LeadStatus.QUALIFIED) {
+      assistantReply = `This session is already completed. How else can we assist you today?\n\n*(IST: ${istTimeStr})*`;
+      await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply });
+      return { sessionId, reply: assistantReply, metadata: { state: currentState, extractedData } };
+    }
+
+    // 3. HARD INTERCEPT: Check if user provided 10-digit phone number at ANY stage
+    const phoneRegex = /\d{10}/;
+    const phoneMatch = userMessage.match(phoneRegex);
+
     if (phoneMatch) {
-      extractedData.phone = phoneMatch[0];
+      lead.phone = phoneMatch[0];
+      const namePart = userMessage.replace(phoneMatch[0], '').replace(/[,]/g, '').trim();
+      if (namePart) lead.firstName = namePart;
+
+      lead.status = LeadStatus.QUALIFIED;
+      currentState = 'COMPLETED';
+      
+      assistantReply = `Thank you, **${lead.firstName || 'Customer'}**! Your inquiry regarding *${extractedData.intent || 'Service Request'}* in **${extractedData.locality || 'your area'}** has been successfully registered. Our regional specialist will call you at ${lead.phone} shortly.\n\n*(IST: ${istTimeStr})*`;
+
+      lead.metadata = { state: currentState, extractedData };
+      await this.leadRepository.save(lead);
+      await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply });
+      return { sessionId, reply: assistantReply, metadata: { state: currentState, extractedData } };
     }
 
-    // --- MARKETPLACE STATE MACHINE WORKFLOW ---
-    if (currentStepIndex === 1) {
-      // Step 1: Intent Forking
-      if (lowerMsg.includes('repair') || lowerMsg.includes('maintenance')) {
-        extractedData.intent = 'Repair & Maintenance';
-      } else if (lowerMsg.includes('explore') || lowerMsg.includes('procedure') || lowerMsg.includes('cost')) {
-        extractedData.intent = 'Explorer';
-        responseContent = `I'd be glad to walk you through the procedures, approvals, and technical roadmaps! Whenever you feel ready to configure a project, let me know.`;
-        quickReplies = ['Plan New Installation', 'Repair & Maintenance'];
-        lead.metadata = { stepIndex: currentStepIndex, extractedData };
-        await this.leadRepository.save(lead);
-        await this.messageRepository.save({ sessionId: activeSessionId, sender: 'assistant', content: responseContent, extractedData });
-        return { sessionId: activeSessionId, reply: responseContent, isQualified: false, leadId: lead.id, extractedData, metadata: { stepIndex: currentStepIndex, quickReplies } };
-      } else {
-        extractedData.intent = 'New Installation';
-      }
-
-      currentStepIndex = 2;
-      responseContent = `Understood (${extractedData.intent}). To find certified specialists near you, what is your locality or area (e.g., Hanamkonda, Warangal)?`;
-      quickReplies = ['Hanamkonda', 'Warangal', 'Secunderabad'];
-    } 
-    else if (currentStepIndex === 2) {
-      // Step 2: Locality Capture & Local Business Listing Query
-      extractedData.locality = userMessage;
-      currentStepIndex = 3;
-
-      // Query verified local businesses in this locality offering this vertical
-      const localBusinesses = await this.businessRepository.find({
-        where: { verticalSlug, locality: userMessage, isActive: true },
-        relations: { services: true },
-      });
-
-      if (localBusinesses.length > 0) {
-        extractedData.availableBusinesses = localBusinesses;
-        responseContent = `Here are the top-rated certified providers in **${userMessage}** for **${verticalName}**. Please select a provider to view their service packages:`;
-        quickReplies = localBusinesses.map((b) => b.name);
-      } else {
-        // Fallback if no local vendor registered in that exact locality
-        responseContent = `We are expanding our network in ${userMessage}! Let's collect your requirements so our regional partner can reach out. ${intakeSteps[1]?.question || 'Please share your details:'}`;
-        quickReplies = intakeSteps[1]?.quickReplies || [];
-      }
-    } 
-    else if (currentStepIndex === 3 && extractedData.availableBusinesses) {
-      // Step 3: Vendor Selection & Service Menu Display
-      const selectedVendor = extractedData.availableBusinesses.find(
-        (b: BusinessEntity) => b.name.toLowerCase() === lowerMsg || b.name.toLowerCase().includes(lowerMsg)
-      );
-
-      if (!selectedVendor) {
-        responseContent = `Please select a valid provider from the list provided below:`;
-        quickReplies = extractedData.availableBusinesses.map((b: BusinessEntity) => b.name);
-      } else {
-        extractedData.selectedBusinessId = selectedVendor.id;
-        extractedData.selectedBusinessName = selectedVendor.name;
-        currentStepIndex = 4;
-
-        const serviceList = selectedVendor.services.map((s: ServiceEntity) => `• **${s.name}**${s.basePrice ? ` (₹${s.basePrice})` : ''}`).join('\n');
-        responseContent = `You selected **${selectedVendor.name}** (${selectedVendor.rating}★). Their available service packages:\n\n${serviceList}\n\nPlease select your preferred service package:`;
-        quickReplies = selectedVendor.services.map((s: ServiceEntity) => s.name);
-      }
-    } 
-    else if (currentStepIndex === 4 && extractedData.selectedBusinessId) {
-      // Step 4: Service Package Selection & Final Contact Prompt
-      extractedData.selectedService = userMessage;
-      currentStepIndex = 5;
-
-      responseContent = `Almost done! Please share your full name and 10-digit mobile phone number so **${extractedData.selectedBusinessName}** can coordinate your booking:`;
-      quickReplies = [];
-    } 
-    else {
-      // Step 5: Name & Phone Parsing and Final Qualification
-      let cleanName = '';
-      if (userMessage.includes(',')) {
-        const parts = userMessage.split(',');
-        cleanName = parts[0].replace(/name[:\s]*/gi, '').trim();
-      } else {
-        const nameMatch = userMessage.match(/(?:name[:\s]*)([a-zA-Z\s]+)(?:[,;\n]|$)/i) || userMessage.match(/^([a-zA-Z\s]{2,30})$/);
-        if (nameMatch) {
-          cleanName = (nameMatch[1] || nameMatch[0]).replace(/phone|number|[:,\-\s0-9]/gi, '').trim();
+    // 4. STRICT LINEAR STATE MACHINE (Zero Fallthroughs to Prevent Loops)
+    switch (currentState) {
+      case 'DISCOVERY':
+      case 'GREETING': {
+        if (lowerMsg.includes('cost') || lowerMsg.includes('price') || lowerMsg.includes('procedure') || lowerMsg.includes('roi') || lowerMsg.includes('subsidy')) {
+          extractedData.intent = 'Explore Procedure & Costs';
+        } else if (lowerMsg.includes('repair') || lowerMsg.includes('maintenance') || lowerMsg.includes('service') || lowerMsg.includes('dispatch')) {
+          extractedData.intent = 'Repair & Maintenance';
+        } else {
+          extractedData.intent = 'Plan New Installation';
         }
+
+        if (lowerMsg.includes('panel') || lowerMsg.includes('solar') || lowerMsg.includes('charger') || lowerMsg.includes('battery')) {
+          extractedData.requestedItem = userMessage.trim();
+        }
+
+        currentState = 'LOCALITY_PENDING';
+        assistantReply = `Understood (**${extractedData.intent}**). Please share your locality or area where service is required:\n\n*(IST: ${istTimeStr})*`;
+        break;
       }
 
-      if (cleanName && cleanName.length > 1) {
-        extractedData.name = cleanName;
-      } else if (!extractedData.name && !phoneMatch && userMessage.length > 2) {
-        extractedData.name = userMessage.replace(/[:,-]/g, ' ').trim();
+      case 'LOCALITY_PENDING': {
+        extractedData.locality = userMessage.trim();
+
+        const businesses = await this.businessRepository.find({ where: { verticalSlug: lead.verticalSlug } });
+        const matchingBusinesses = businesses.filter(
+          b => b.locality.toLowerCase() === extractedData.locality.toLowerCase()
+        );
+
+        if (matchingBusinesses.length > 0) {
+          const businessList = matchingBusinesses.map(b => `• **${b.name}** (Rating: ${b.rating}⭐)`).join('\n');
+          assistantReply = `I found verified providers for **${extractedData.intent}** in **${extractedData.locality}**:\n\n${businessList}\n\nPlease share your full name and 10-digit mobile number so our team can coordinate:\n\n*(IST: ${istTimeStr})*`;
+        } else {
+          assistantReply = `Thank you for sharing your location. While our primary partner network is currently expanding into **${extractedData.locality}**, our regional engineering team would be delighted to assist you with a custom service arrangement.\n\nPlease share your full name and 10-digit mobile phone number, and our specialist will reach out to coordinate your request:\n\n*(IST: ${istTimeStr})*`;
+        }
+
+        currentState = 'CONTACT_PENDING';
+        break;
       }
 
-      if (extractedData.name && extractedData.phone) {
-        lead.firstName = extractedData.name;
-        lead.phone = extractedData.phone;
-        isQualified = true;
-        currentStepIndex = 6;
+      case 'CONTACT_PENDING': {
+        assistantReply = `Please share your full name and 10-digit mobile phone number so our specialist can finalize your request:\n\n*(IST: ${istTimeStr})*`;
+        break;
+      }
 
-        responseContent = `Thank you, ${lead.firstName}! Your booking with **${extractedData.selectedBusinessName || 'our certified partner'}** has been successfully logged.\n\n- Vertical: ${verticalName}\n- Intent: ${extractedData.intent}\n- Locality: ${extractedData.locality}\n- Selected Service: ${extractedData.selectedService || 'Standard Package'}\n- Contact Phone: ${lead.phone}\n\nThe provider's specialist will reach out to you shortly.`;
-        quickReplies = [];
-      } else {
-        responseContent = `Please provide your full name and valid 10-digit mobile phone number to confirm your booking:`;
-        quickReplies = [];
+      default: {
+        currentState = 'CONTACT_PENDING';
+        assistantReply = `Please share your full name and 10-digit mobile phone number so our specialist can finalize your request:\n\n*(IST: ${istTimeStr})*`;
+        break;
       }
     }
 
-    lead.metadata = { stepIndex: currentStepIndex, extractedData };
-    if (isQualified) {
-      lead.status = LeadStatus.NEW;
+    lead.metadata = { state: currentState, extractedData };
+    await this.leadRepository.save(lead);
+    await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply });
+
+    return {
+      sessionId,
+      reply: assistantReply,
+      metadata: { state: currentState, extractedData },
+    };
+  }
+
+  private async processServiceOrContact(verticalSlug: string, verticalName: string, sessionId: string, lead: Lead, extractedData: any, selectedVendor: BusinessEntity) {
+    let targetServices = selectedVendor.services;
+    if (extractedData.intent === 'Repair & Maintenance') {
+      targetServices = selectedVendor.services.filter((s: ServiceEntity) => 
+        s.name.toLowerCase().includes('repair') || 
+        s.name.toLowerCase().includes('servicing') || 
+        s.name.toLowerCase().includes('maintenance') ||
+        s.name.toLowerCase().includes('audit')
+      );
+      if (targetServices.length === 0) targetServices = selectedVendor.services;
     }
+
+    extractedData.availableServices = targetServices;
+    const currentState = 'SERVICE_SELECTION';
+
+    const serviceList = targetServices.map((s: ServiceEntity) => `• **${s.name}**${s.basePrice ? ` (₹${s.basePrice})` : ''}`).join('\n');
+    const responseContent = `You selected **${selectedVendor.name}** (${selectedVendor.rating}★). Available service packages for your **${extractedData.intent}** request:\n\n${serviceList}\n\nPlease select your preferred service package:`;
+    const quickReplies = targetServices.map((s: ServiceEntity) => s.name);
+
+    lead.metadata = { state: currentState, extractedData };
     await this.leadRepository.save(lead);
 
-    if (isQualified) {
-      await this.queueService.addMarketplaceMatchingJob({
-        leadId: lead.id,
-        verticalSlug,
-        sessionId: activeSessionId,
-        metadata: extractedData,
-      });
-    }
-
     await this.messageRepository.save({
-      sessionId: activeSessionId,
+      sessionId,
       sender: 'assistant',
       content: responseContent,
       extractedData,
     });
 
     return {
-      sessionId: activeSessionId,
+      sessionId,
       reply: responseContent,
-      isQualified,
+      isQualified: false,
       leadId: lead.id,
       extractedData,
-      metadata: {
-        stepIndex: currentStepIndex,
-        quickReplies: isQualified ? [] : quickReplies,
-      },
+      metadata: { state: currentState, quickReplies },
     };
   }
 

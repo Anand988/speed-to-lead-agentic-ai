@@ -24,19 +24,15 @@ export class ChatController {
     @Body() body: { sessionId?: string; message: string; verticalSlug?: string; tenantId?: string },
     @Req() req: any,
   ) {
-    const userId = req.user?.id || 'anonymous-user';
     const userMessage = body.message;
-    const vertical = body.verticalSlug || 'Solar Panel Installation';
-    const conversationId = body.sessionId || null;
-    const tenantId = body.tenantId;
+    const conversationId = body.sessionId;
 
-    return await this.chatService.processMessage(
-      userId,
-      conversationId,
-      userMessage,
-      vertical,
-      tenantId,
-    );
+    if (!conversationId) {
+      throw new Error('sessionId is required to process messages.');
+    }
+
+    // Pass the correct 2 parameters matching the service method signature
+    return await this.chatService.processMessage(conversationId, userMessage);
   }
 
   @Get('history/:sessionId')

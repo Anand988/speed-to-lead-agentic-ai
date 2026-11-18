@@ -15,6 +15,7 @@ import { Message } from './modules/chat/entities/message.entity.js';
 
 // Feature Modules
 import { VendorModule } from './modules/vendors/vendor.moule.js';
+import { TenantModule } from './modules/tenant/tenant.module.js';
 import { AppointmentModule } from './modules/appointments/appointment.module.js';
 import { TrackingModule } from './modules/tracking/tracking.module.js';
 import { PaymentModule } from './modules/payments/payment.module.js';
@@ -72,6 +73,7 @@ import { User } from './modules/user/user.entity.js';
     DispatchModule,
     LeadOrchestratorModule,
     ChatModule,
+    TenantModule
   ],
 })
 export class AppModule {}
