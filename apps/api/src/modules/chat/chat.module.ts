@@ -12,10 +12,11 @@ import { BusinessEntity } from '../tenant/entities/business.entity.js';
 import { ServiceEntity } from '../tenant/entities/service.entity.js';
 import { QueueModule } from '../queue/queue.module.js';
 import { ChatCacheService } from './chat-cache.service.js';
+import { LocalityEntity } from '../tenant/entities/locality.entity.js';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Lead, Message, VerticalEntity, BusinessEntity, ServiceEntity]),
+    TypeOrmModule.forFeature([Lead, Message, VerticalEntity, BusinessEntity, ServiceEntity, LocalityEntity]),
     QueueModule,
   ],
   controllers: [ChatController],

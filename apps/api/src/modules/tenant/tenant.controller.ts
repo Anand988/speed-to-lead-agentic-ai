@@ -1,4 +1,3 @@
-// apps/api/src/modules/tenant/tenant.controller.ts
 import {
   Controller,
   Post,
@@ -57,6 +56,11 @@ class CreateBusinessDto {
   locality!: string;
 
   @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  serviceAreas?: string[];
+
+  @IsOptional()
   @IsNumber()
   @Min(1)
   @Max(5)
@@ -90,6 +94,11 @@ class UpdateBusinessDto {
   locality?: string;
 
   @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  serviceAreas?: string[];
+
+  @IsOptional()
   @IsNumber()
   @Min(1)
   @Max(5)
@@ -111,6 +120,53 @@ class ToggleBusinessStatusDto {
   isActive!: boolean;
 }
 
+class CreateLocalityDto {
+  @IsString()
+  @IsNotEmpty()
+  name!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  parentCity!: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  postalCodes?: string[];
+
+  @IsOptional()
+  @IsBoolean()
+  isActive?: boolean;
+}
+
+class BulkCreateLocalitiesDto {
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => CreateLocalityDto)
+  localities!: CreateLocalityDto[];
+}
+
+class UpdateLocalityDto {
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  name?: string;
+
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  parentCity?: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  postalCodes?: string[];
+
+  @IsOptional()
+  @IsBoolean()
+  isActive?: boolean;
+}
+
 @Controller('api/v1/tenants')
 @UsePipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }))
 export class TenantController {
@@ -127,6 +183,8 @@ export class TenantController {
   async listTenants() {
     return await this.tenantService.findAllTenants();
   }
+
+  // --- BUSINESSES ---
 
   @Get('businesses')
   @HttpCode(HttpStatus.OK)
@@ -156,5 +214,34 @@ export class TenantController {
     @Body() dto: ToggleBusinessStatusDto,
   ) {
     return await this.tenantService.toggleBusinessStatus(id, dto.isActive);
+  }
+
+  // --- LOCALITIES ---
+
+  @Get('localities')
+  @HttpCode(HttpStatus.OK)
+  async listLocalities(@Query('parentCity') parentCity?: string) {
+    return await this.tenantService.listLocalities(parentCity);
+  }
+
+  @Post('localities')
+  @HttpCode(HttpStatus.CREATED)
+  async createLocality(@Body() dto: CreateLocalityDto) {
+    return await this.tenantService.createLocality(dto);
+  }
+
+  @Post('localities/bulk')
+  @HttpCode(HttpStatus.CREATED)
+  async bulkCreateLocalities(@Body() dto: BulkCreateLocalitiesDto) {
+    return await this.tenantService.bulkCreateLocalities(dto.localities);
+  }
+
+  @Patch('localities/:id')
+  @HttpCode(HttpStatus.OK)
+  async updateLocality(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: UpdateLocalityDto,
+  ) {
+    return await this.tenantService.updateLocality(id, dto);
   }
 }

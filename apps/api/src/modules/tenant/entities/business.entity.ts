@@ -13,7 +13,10 @@ export class BusinessEntity {
   verticalSlug!: string; // e.g., 'solar-panel-installation'
 
   @Column()
-  locality!: string; // e.g., 'Hanamkonda', 'Warangal', 'Secunderabad'
+  locality!: string; // Primary city or locality, e.g., 'Hyderabad', 'Hanamkonda'
+
+  @Column({ type: 'jsonb', default: () => "'[]'" })
+  serviceAreas!: string[]; // Optional sub-localities served, e.g., ['Gachibowli', 'Madhapur']
 
   @Column({ type: 'decimal', precision: 2, scale: 1, default: 4.8 })
   rating!: number;
