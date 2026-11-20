@@ -20,6 +20,14 @@ export class VerticalEntity {
     quickReplies: string[];
   }>;
 
+  /// Stores vertical-specific UI and AI configuration (placeholders, quick replies, prompts)
+  @Column({ type: 'jsonb', nullable: true, default: () => "'{}'" })
+  metadata: {
+    requirementPlaceholder?: string;
+    quickReplies?: string[];
+    systemPrompt?: string;
+  } | null;
+
   @CreateDateColumn()
   createdAt: Date;
 

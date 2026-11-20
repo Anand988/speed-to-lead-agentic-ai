@@ -59,6 +59,8 @@ import { User } from './modules/user/user.entity.js';
         connection: {
           host: configService.get<string>('REDIS_HOST', 'localhost'),
           port: parseInt(configService.get<string>('REDIS_PORT', '6379'), 10),
+          maxRetriesPerRequest: null,
+          retryStrategy: (times: number) => Math.min(times * 1000, 30_000),
         },
       }),
     }),
@@ -73,7 +75,7 @@ import { User } from './modules/user/user.entity.js';
     DispatchModule,
     LeadOrchestratorModule,
     ChatModule,
-    TenantModule
+    TenantModule,
   ],
 })
 export class AppModule {}

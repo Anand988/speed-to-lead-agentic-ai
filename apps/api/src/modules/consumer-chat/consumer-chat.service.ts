@@ -6,7 +6,7 @@ import { Repository } from 'typeorm';
 import { QueueService } from '../queue/queue.service.js';
 import { Lead, LeadStatus } from '../lead/lead.entity.js';
 import { Message } from './message.entity.js';
-import { VerticalEntity } from '../tenant/entities/domain.entity.js';
+import { VerticalEntity } from '../tenant/entities/vertical.entity.js';
 
 @Injectable()
 export class ConsumerChatService {
@@ -185,7 +185,7 @@ export class ConsumerChatService {
         leadId: lead.id,
         verticalSlug,
         sessionId,
-        metadata: extractedData,
+        metadata: extractedData
       });
       this.logger.log(`Lead ${lead.id} successfully qualified and queued.`);
     }

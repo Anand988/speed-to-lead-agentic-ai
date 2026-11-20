@@ -2,7 +2,7 @@
 import { Controller, Get } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { VerticalEntity } from './entities/domain.entity.js';
+import { VerticalEntity } from './entities/vertical.entity.js';
 
 @Controller('api/verticals')
 export class VerticalController {
