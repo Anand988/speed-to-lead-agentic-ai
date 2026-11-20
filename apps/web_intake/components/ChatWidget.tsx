@@ -1,17 +1,29 @@
 // apps/web_intake/components/ChatWidget.tsx
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { startChatSession, sendChatMessage } from '@/services/chatApi';
+
+interface VendorItem {
+  id: string;
+  name: string;
+  rating?: number;
+  locality?: string;
+  [key: string]: any;
+}
 
 interface Message {
   role: 'user' | 'assistant';
   content: string;
   metadata?: {
     step?: string;
+    stepIndex?: number;
     quote?: any;
     appointmentId?: string;
     paymentUrl?: string;
+    quickReplies?: string[];
+    uiComponentType?: 'LOCALITY_CHIPS' | 'VENDOR_CARDS' | 'NONE';
+    uiPayload?: VendorItem[];
   };
 }
 
@@ -26,55 +38,60 @@ export default function ChatWidget({ initialVertical, initialMessage, onClose }:
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [conversationId, setConversationId] = useState<string | null>(null);
+  
+  // Guard ref to strictly prevent duplicate session initialization on re-renders
+  const hasInitialized = useRef(false);
 
   useEffect(() => {
-    if (initialMessage) {
-      handleInitialSubmission(initialMessage);
+    if (initialVertical && !hasInitialized.current) {
+      hasInitialized.current = true;
+      initializeWidgetSession();
     }
-  }, [initialMessage]);
+  }, [initialVertical]);
 
-  const handleInitialSubmission = async (text: string) => {
-    const userMsg: Message = { role: 'user', content: text };
-    setMessages([userMsg]);
+  const initializeWidgetSession = async () => {
     setLoading(true);
 
     try {
-      // 1. Start Session dynamically via API service
-      const startData = await startChatSession(initialVertical);
+      // 1. Start session and pass initialMessage to the backend for context awareness
+      const startData = await startChatSession(initialVertical, initialMessage);
       const activeSessionId = startData.sessionId;
       if (activeSessionId) setConversationId(activeSessionId);
 
-      // 2. Send Initial Message dynamically
-      const data = await sendChatMessage(activeSessionId, text, initialVertical);
+      // 2. Build initial message history: User's typed requirement first, then assistant's greeting
+      const initialChatHistory: Message[] = [];
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: data.reply || 'Processed successfully.',
-          metadata: data.metadata,
-        },
-      ]);
+      if (initialMessage && initialMessage.trim().length > 0) {
+        initialChatHistory.push({
+          role: 'user',
+          content: initialMessage.trim(),
+        });
+      }
+
+      initialChatHistory.push({
+        role: 'assistant',
+        content: startData.initialMessage || `Hello! Let's get your ${initialVertical} project set up.`,
+        metadata: startData.metadata,
+      });
+
+      setMessages(initialChatHistory);
     } catch (err) {
       console.error('API Error:', err);
-      setMessages((prev) => [...prev, { role: 'assistant', content: 'Failed to connect to backend orchestration service.' }]);
+      setMessages([{ role: 'assistant', content: 'Failed to connect to backend orchestration service.' }]);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleSendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || loading || !conversationId) return;
+  const submitMessageText = async (textToSend: string) => {
+    if (!textToSend.trim() || loading || !conversationId) return;
 
-    const userText = input;
-    setInput('');
-    const userMsg: Message = { role: 'user', content: userText };
+    const userMsg: Message = { role: 'user', content: textToSend };
     setMessages((prev) => [...prev, userMsg]);
     setLoading(true);
 
     try {
-      const data = await sendChatMessage(conversationId, userText, initialVertical);
+      const data = await sendChatMessage(conversationId, textToSend, initialVertical);
       setMessages((prev) => [
         ...prev,
         {
@@ -89,6 +106,13 @@ export default function ChatWidget({ initialVertical, initialMessage, onClose }:
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const text = input;
+    setInput('');
+    await submitMessageText(text);
   };
 
   return (
@@ -113,9 +137,56 @@ export default function ChatWidget({ initialVertical, initialMessage, onClose }:
                   : 'bg-slate-800 text-slate-200 border border-slate-700 rounded-bl-none'
               }`}
             >
-              {/* Clean up raw markdown asterisks for polished UI presentation */}
               <p>{msg.content.replace(/\*\*/g, '')}</p>
 
+              {/* Quick Reply Option Chips rendered dynamically */}
+              {msg.metadata?.quickReplies && msg.metadata.quickReplies.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 mt-2.5 pt-2 border-t border-slate-700/80">
+                  {msg.metadata.quickReplies.map((option, optIdx) => (
+                    <button
+                      key={optIdx}
+                      type="button"
+                      onClick={() => submitMessageText(option)}
+                      disabled={loading}
+                      className="bg-slate-700 hover:bg-emerald-600 text-slate-100 text-[11px] font-medium px-2.5 py-1 rounded-lg transition disabled:opacity-50 shadow-sm"
+                    >
+                      {option}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Dynamic Vendor Cards Rendering */}
+              {msg.metadata?.uiComponentType === 'VENDOR_CARDS' && msg.metadata.uiPayload && msg.metadata.uiPayload.length > 0 && (
+                <div className="flex flex-col gap-2 mt-3 pt-2 border-t border-slate-700/80 w-full">
+                  {msg.metadata.uiPayload.map((vendor) => (
+                    <div 
+                      key={vendor.id} 
+                      className="p-3 bg-slate-900/90 border border-slate-700 rounded-xl flex flex-col justify-between shadow-sm hover:border-emerald-500/50 transition"
+                    >
+                      <div className="flex justify-between items-start mb-1">
+                        <span className="font-semibold text-slate-100 text-xs">{vendor.name}</span>
+                        {vendor.rating && (
+                          <span className="bg-amber-500/10 text-amber-400 border border-amber-500/20 text-[10px] px-1.5 py-0.5 rounded font-medium">
+                            ★ {vendor.rating}
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-slate-400 mb-2">Locality: {vendor.locality || 'Verified Area Partner'}</p>
+                      <button
+                        type="button"
+                        onClick={() => submitMessageText(`Select vendor: ${vendor.name}`)}
+                        disabled={loading}
+                        className="w-full py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-semibold rounded-lg transition shadow-xs disabled:opacity-50"
+                      >
+                        Select Provider
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Payment URL Link */}
               {msg.metadata?.paymentUrl && (
                 <div className="mt-2 pt-2 border-t border-slate-700">
                   <a
@@ -134,7 +205,7 @@ export default function ChatWidget({ initialVertical, initialMessage, onClose }:
         {loading && (
           <div className="flex justify-start">
             <div className="bg-slate-800 border border-slate-700 text-slate-400 text-xs rounded-xl px-3 py-2 animate-pulse">
-              Orchestrating vendors & pricing...
+              Orchestrating workflow step...
             </div>
           </div>
         )}

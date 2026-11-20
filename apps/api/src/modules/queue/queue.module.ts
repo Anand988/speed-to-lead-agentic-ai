@@ -1,29 +1,19 @@
 // apps/api/src/modules/queue/queue.module.ts
-import { Module } from '@nestjs/common';
-import { ConfigModule, ConfigService } from '@nestjs/config';
+import { Module, forwardRef } from '@nestjs/common';
 import { BullModule } from '@nestjs/bullmq';
-import { LeadProcessor } from './processors/lead-processor.js';
 import { QueueService } from './queue.service.js';
 import { QueueController } from './queue.controller.js';
+import { TenantModule } from '../tenant/tenant.module.js'; // <-- TenantContextService lives here
 
 @Module({
   imports: [
-    BullModule.forRootAsync({
-      imports: [ConfigModule],
-      inject: [ConfigService],
-      useFactory: (configService: ConfigService) => ({
-        connection: {
-          host: configService.get<string>('REDIS_HOST') || 'localhost',
-          port: configService.get<number>('REDIS_PORT') || 6379,
-        },
-      }),
-    }),
     BullModule.registerQueue({
-      name: 'lead-processing',
+      name: 'lead-dispatch',
     }),
+    forwardRef(() => TenantModule), // <-- Breaks ESM circular initialization with TenantModule -> ChatModule -> QueueModule
   ],
   controllers: [QueueController],
-  providers: [LeadProcessor, QueueService],
-  exports: [BullModule, QueueService],
+  providers: [QueueService],
+  exports: [QueueService, BullModule],
 })
 export class QueueModule {}

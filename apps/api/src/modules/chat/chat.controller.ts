@@ -1,5 +1,5 @@
 // apps/api/src/modules/chat/chat.controller.ts
-import { Controller, Post, Body, Req } from '@nestjs/common';
+import { Controller, Post, Get, Param, Body, Req } from '@nestjs/common';
 import { ChatService } from './chat.service.js';
 
 @Controller('api/v1/consumer/chat')
@@ -8,14 +8,15 @@ export class ChatController {
 
   @Post('start')
   async startSession(
-    @Body() body: { verticalSlug?: string; tenantId?: string },
+    @Body() body: { verticalSlug?: string; tenantId?: string; initialMessage?: string },
     @Req() req: any,
   ) {
     const userId = req.user?.id || 'anonymous-user';
     const vertical = body.verticalSlug || 'Solar Panel Installation';
     const tenantId = body.tenantId;
+    const initialMessage = body.initialMessage;
 
-    return await this.chatService.createSession(userId, vertical, tenantId);
+    return await this.chatService.createSession(userId, vertical, tenantId, initialMessage);
   }
 
   @Post('message')
@@ -23,18 +24,19 @@ export class ChatController {
     @Body() body: { sessionId?: string; message: string; verticalSlug?: string; tenantId?: string },
     @Req() req: any,
   ) {
-    const userId = req.user?.id || 'anonymous-user';
     const userMessage = body.message;
-    const vertical = body.verticalSlug || 'Solar Panel Installation';
-    const conversationId = body.sessionId || null;
-    const tenantId = body.tenantId;
+    const conversationId = body.sessionId;
 
-    return await this.chatService.processMessage(
-      userId,
-      conversationId,
-      userMessage,
-      vertical,
-      tenantId,
-    );
+    if (!conversationId) {
+      throw new Error('sessionId is required to process messages.');
+    }
+
+    // Pass the correct 2 parameters matching the service method signature
+    return await this.chatService.processMessage(conversationId, userMessage);
+  }
+
+  @Get('history/:sessionId')
+  async getHistory(@Param('sessionId') sessionId: string) {
+    return await this.chatService.getSessionHistory(sessionId);
   }
 }

@@ -1,26 +1,30 @@
 // apps/api/src/modules/chat/chat.module.ts
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { ConfigModule } from '@nestjs/config';
-import { BullModule } from '@nestjs/bullmq';
-import { Conversation } from './entities/conversation.entity.js';
-import { Message } from './entities/message.entity.js';
-import { ChatService } from './chat.service.js';
 import { ChatController } from './chat.controller.js';
-import { AiService } from './ai.service.js';
-import { LeadOrchestratorModule } from '../orchestrator/lead-orchstrator.module.js'; // 👉 Import LeadOrchestratorModule
+import { ChatService } from './chat.service.js';
+import { DeepSeekExtractorService } from './deepseek-extractor.service.js';
+import { VerticalPromptService } from '../consumer-chat/vertical-prompt.service.js';
+import { Lead } from '../lead/lead.entity.js';
+import { Message } from '../consumer-chat/message.entity.js';
+import { VerticalEntity } from '../tenant/entities/vertical.entity.js';
+import { BusinessEntity } from '../tenant/entities/business.entity.js';
+import { ServiceEntity } from '../tenant/entities/service.entity.js';
+import { QueueModule } from '../queue/queue.module.js';
+import { ChatCacheService } from './chat-cache.service.js';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Conversation, Message]),
-    ConfigModule,
-    BullModule.registerQueue({
-      name: 'lead-processing',
-    }),
-    LeadOrchestratorModule, // 👉 Add this here so ChatController can inject LeadOrchestratorService
+    TypeOrmModule.forFeature([Lead, Message, VerticalEntity, BusinessEntity, ServiceEntity]),
+    QueueModule,
   ],
   controllers: [ChatController],
-  providers: [ChatService, AiService],
-  exports: [ChatService, AiService],
+  providers: [
+    ChatService,
+    DeepSeekExtractorService,
+    VerticalPromptService,
+    ChatCacheService,
+  ],
+  exports: [ChatService, DeepSeekExtractorService, VerticalPromptService, ChatCacheService],
 })
 export class ChatModule {}

@@ -9,8 +9,8 @@ import {
   OneToMany,
   JoinColumn,
 } from 'typeorm';
-import { Tenant } from '../../tenant/tenant.entity.js'; // Adjust path per your structure
-import { Message } from '../entities/message.entity.js'; // Adjust path per your structure
+import { Tenant } from '../../tenant/tenant.entity.js';
+import { Message } from '../entities/message.entity.js';
 
 @Entity('conversations')
 export class Conversation {
@@ -30,6 +30,14 @@ export class Conversation {
   @Column({ default: 'active' })
   status: string; // 'active', 'qualified', 'closed'
 
+  // 👉 Added to track which vertical/domain this session belongs to
+  @Column({ name: 'vertical_slug', nullable: true })
+  verticalSlug: string;
+
+  // 👉 Added to track the current wizard step index (prevents loops)
+  @Column({ name: 'step_index', default: 1 })
+  stepIndex: number;
+
   @Column({ type: 'jsonb', nullable: true })
   extractedLeadData: {
     name?: string;
@@ -39,9 +47,8 @@ export class Conversation {
     score?: number;
   };
 
-  // apps/api/src/modules/chat/entities/conversation.entity.ts
-@OneToMany('Message', (message: any) => message.conversation, { cascade: true })
-messages: any[];
+  @OneToMany(() => Message, (message: Message) => message.conversation, { cascade: true })
+  messages: Message[];
 
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
