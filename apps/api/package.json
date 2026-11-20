@@ -17,6 +17,7 @@
     "start:prod": "NODE_ENV=production node dist/main",
     "start:debug": "nest start --debug --watch",
     "lint": "oxlint --type-aware src/ test/",
+    "test:e2e:chat": "node scripts/test-e2e-chat-flows.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:cov": "vitest run --coverage",
