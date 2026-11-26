@@ -16,6 +16,9 @@ export class LocalityEntity {
   @Column()
   name!: string; // e.g., 'Gachibowli', 'Madhapur', 'Hyderabad'
 
+  @Column({ type: 'jsonb', default: () => "'[]'" })
+  aliases!: string[]; // e.g., ['gachi bowli', 'dlf cyber city']
+
   @Index()
   @Column()
   parentCity!: string; // e.g., 'Hyderabad' (for top-level cities, set parentCity = 'Hyderabad')

@@ -20,9 +20,11 @@ import type {
   CollectedData,
   LastPromptMeta,
 } from './chat-guard.types.js';
+import { ChatStage1Service } from './chat-stage1.service.js';
 
 export interface CachedLocalityNode {
   name: string;
+  aliases: string[];
   parentCity: string;
   postalCodes: string[];
 }
@@ -55,6 +57,7 @@ export class ChatService {
   private readonly logger = new Logger(ChatService.name);
 
   constructor(
+    private readonly chatStage1Service: ChatStage1Service,
     private readonly chatGuardService: ChatGuardService,
     private readonly queueService: QueueService,
     private readonly deepSeekExtractorService: DeepSeekExtractorService,
@@ -106,10 +109,96 @@ export class ChatService {
     }
   }
 
+  private async resolveStage1Transition(params: {
+    verticalSlug: string;
+    verticalMeta: VerticalMetadataConfig | null;
+    businesses: CachedVendorSummary[];
+    extractedData: any;
+    istTimeStr: string;
+  }): Promise<{
+    state: string;
+    reply: string;
+    quickReplies: string[];
+    uiComponentType?: string;
+    uiPayload?: any;
+    activeQualifierKey?: string;
+  }> {
+    const { verticalSlug, verticalMeta, businesses, extractedData, istTimeStr } = params;
+
+    // Keep serviceIntent synced with legacy intent
+    if (extractedData.intent && !extractedData.serviceIntent) {
+      extractedData.serviceIntent = extractedData.intent;
+    }
+
+    const nextStep = this.chatStage1Service.determineNextStage1Step(
+      verticalMeta,
+      extractedData,
+    );
+
+    if (nextStep.nextState === 'VERTICAL_QUALIFIER_PENDING') {
+      const q = nextStep.pendingQualifier;
+      return {
+        state: 'VERTICAL_QUALIFIER_PENDING',
+        reply: `${q.prompt}\n\n*(IST: ${istTimeStr})*`,
+        quickReplies: Array.isArray(q.options) ? [...q.options] : [],
+        activeQualifierKey: q.key,
+      };
+    }
+
+    if (nextStep.nextState === 'LOCALITY_PENDING') {
+      return {
+        state: 'LOCALITY_PENDING',
+        reply: `Understood (**${extractedData.serviceIntent || extractedData.intent}**). Please enter your city, locality, or PIN code where service is required:\n\n*(IST: ${istTimeStr})*`,
+        quickReplies: [],
+      };
+    }
+
+    // READY_FOR_VENDORS -> resolve locality via 4-priority engine
+    const rawLocality =
+      extractedData.subLocality || extractedData.postalCode || extractedData.locality;
+    const dbNodes = await this.getCachedLocalities();
+    const resolved = this.chatStage1Service.resolveLocality(String(rawLocality || ''), dbNodes);
+
+    extractedData.subLocality = resolved.subLocality || rawLocality;
+    extractedData.resolvedCity = resolved.resolvedCity;
+    extractedData.postalCode = resolved.postalCode;
+    extractedData.locality = resolved.subLocality || rawLocality;
+
+    const matchingBusinesses = await this.getMatchingVendorsForLocality(
+      verticalSlug,
+      extractedData.locality as string,
+      businesses,
+    );
+
+    if (matchingBusinesses.length > 0) {
+      extractedData.isServiceable = true;
+      return {
+        state: 'VENDOR_SELECTION',
+        reply: `I found verified providers for **${extractedData.serviceIntent || extractedData.intent}** in **${extractedData.locality}**. Select a provider below or share your contact details:\n\n*(IST: ${istTimeStr})*`,
+        quickReplies: [],
+        uiComponentType: 'VENDOR_CARDS',
+        uiPayload: matchingBusinesses,
+      };
+    }
+
+    extractedData.isServiceable = false;
+    return {
+      state: 'EXPANSION_CAPTURE',
+      reply: this.formatExpansionReply(
+        extractedData.locality as string,
+        verticalMeta,
+        istTimeStr,
+      ),
+      quickReplies: [],
+      uiComponentType: 'EXPANSION_CAPTURE',
+    };
+  }
+
   private buildLastPromptMeta(
     state: string,
     quickReplies: string[] = [],
     uiPayload?: any[],
+    activeQualifierKey?: string,
   ): LastPromptMeta {
     const guardState = this.toGuardState(state);
     const options =
@@ -139,6 +228,7 @@ export class ChatService {
     return {
       expectedInput: expectedInputMap[guardState] ?? 'NONE',
       options,
+      ...(activeQualifierKey ? { activeQualifierKey } : {}),
     };
   }
 
@@ -240,7 +330,7 @@ export class ChatService {
     targetLocality: string,
     dbLocalityNodes: CachedLocalityNode[],
   ): 'direct' | 'city_fallback' | null {
-    const resolved = this.resolveLocationFromDb(targetLocality, dbLocalityNodes);
+    const resolved = this.chatStage1Service.resolveLocality(targetLocality, dbLocalityNodes);
     if (!resolved.normalizedInput) return null;
 
     const bizAreas = [business.locality, ...(business.serviceAreas || [])]
@@ -250,7 +340,13 @@ export class ChatService {
     if (bizAreas.length === 0) return null;
 
     const directCandidates = Array.from(
-      new Set([resolved.normalizedInput, resolved.resolvedName].filter((v): v is string => Boolean(v))),
+      new Set(
+        [
+          resolved.normalizedInput,
+          resolved.subLocality ? this.normalizeLocalityKey(resolved.subLocality) : null,
+          resolved.postalCode ? this.normalizeLocalityKey(resolved.postalCode) : null,
+        ].filter((v): v is string => Boolean(v)),
+      ),
     );
 
     const isDirectMatch = bizAreas.some((area) =>
@@ -262,8 +358,9 @@ export class ChatService {
       return 'direct';
     }
 
-    if (resolved.parentCity) {
-      const isCityFallback = bizAreas.some((area) => area === resolved.parentCity);
+    if (resolved.resolvedCity) {
+      const normCity = this.normalizeLocalityKey(resolved.resolvedCity);
+      const isCityFallback = bizAreas.some((area) => area === normCity);
       if (isCityFallback) {
         return 'city_fallback';
       }
@@ -293,7 +390,15 @@ export class ChatService {
     const lower = trimmed.toLowerCase();
 
     // 1. Late states never need LLM extraction
-    if (['VENDOR_SELECTION', 'SERVICE_SELECTION', 'CONTACT_PENDING'].includes(currentState)) {
+    if (
+      [
+        'VERTICAL_QUALIFIER_PENDING',
+        'EXPANSION_CAPTURE',
+        'VENDOR_SELECTION',
+        'SERVICE_SELECTION',
+        'CONTACT_PENDING',
+      ].includes(currentState)
+    ) {
       return { handled: true, data: currentData };
     }
 
@@ -1118,46 +1223,53 @@ export class ChatService {
           extractedData.locality = userMessage.trim();
         }
 
-        const matchingBusinesses = await this.getMatchingVendorsForLocality(
-          lead.verticalSlug,
-          extractedData.locality as string,
+        const transition = await this.resolveStage1Transition({
+          verticalSlug: lead.verticalSlug,
+          verticalMeta,
           businesses,
-        );
+          extractedData,
+          istTimeStr,
+        });
 
-        if (matchingBusinesses.length > 0) {
-          const uiPayload = matchingBusinesses;
+        currentState = transition.state;
+        assistantReply = transition.reply;
+        activeQuickReplies = transition.quickReplies;
 
-          currentState = 'VENDOR_SELECTION';
-          assistantReply = `I found verified providers for **${extractedData.intent || 'Service Request'}** in **${extractedData.locality}**. Select a provider below:\n\n*(IST: ${istTimeStr})*`;
+        lead.metadata = {
+          state: currentState,
+          extractedData,
+          uiComponentType: transition.uiComponentType,
+          uiPayload: transition.uiPayload,
+          quickReplies: activeQuickReplies,
+          invalidAttempts: 0,
+          lastPromptMeta: this.buildLastPromptMeta(
+            currentState,
+            activeQuickReplies,
+            transition.uiPayload,
+            transition.activeQualifierKey,
+          ),
+        };
+        await this.leadRepository.save(lead);
+        await this.messageRepository.save({
+          sessionId,
+          sender: 'assistant',
+          content: assistantReply,
+          extractedData,
+        });
 
-          lead.metadata = {
+        return {
+          sessionId,
+          reply: assistantReply,
+          metadata: {
             state: currentState,
             extractedData,
-            uiComponentType: 'VENDOR_CARDS',
-            uiPayload,
-            quickReplies: [],
-            invalidAttempts: 0,
-            lastPromptMeta: this.buildLastPromptMeta(currentState, [], uiPayload),
-          };
-          await this.leadRepository.save(lead);
-          await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply, extractedData });
-
-          return {
-            sessionId,
-            reply: assistantReply,
-            metadata: { state: currentState, extractedData, uiComponentType: 'VENDOR_CARDS', uiPayload, quickReplies: [] },
-          };
-        } else {
-          activeQuickReplies = [];
-          assistantReply = this.formatExpansionReply(
-            extractedData.locality as string,
-            verticalMeta,
-            istTimeStr,
-          );
-          currentState = 'CONTACT_PENDING';
-        }
-        break;
+            uiComponentType: transition.uiComponentType,
+            uiPayload: transition.uiPayload,
+            quickReplies: activeQuickReplies,
+          },
+        };
       }
+      
 
       case 'VENDOR_SELECTION': {
         const selectedVendorSummary =
@@ -1198,6 +1310,95 @@ export class ChatService {
         break;
       }
 
+      case 'VERTICAL_QUALIFIER_PENDING': {
+        const activeKey = metadata.lastPromptMeta?.activeQualifierKey;
+        const activeQuestion =
+          verticalMeta?.qualifierQuestions?.find((q) => q.key === activeKey) ??
+          this.chatStage1Service.getNextPendingQualifier(
+            verticalMeta,
+            extractedData.serviceIntent || extractedData.intent,
+            extractedData.verticalAttributes,
+          );
+
+        if (activeQuestion) {
+          const validation = this.chatStage1Service.validateQualifierAnswer(
+            activeQuestion,
+            userMessage,
+          );
+
+          if (!validation.valid) {
+            currentState = 'VERTICAL_QUALIFIER_PENDING';
+            activeQuickReplies = Array.isArray(activeQuestion.options)
+              ? [...activeQuestion.options]
+              : [];
+            assistantReply = `Please choose a valid option for: **${activeQuestion.prompt}**\n\n*(IST: ${istTimeStr})*`;
+            lead.metadata = {
+              state: currentState,
+              extractedData,
+              quickReplies: activeQuickReplies,
+              invalidAttempts: invalidAttempts + 1,
+              lastPromptMeta: this.buildLastPromptMeta(
+                currentState,
+                activeQuickReplies,
+                undefined,
+                activeQuestion.key,
+              ),
+            };
+            await this.leadRepository.save(lead);
+            await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply });
+            return {
+              sessionId,
+              reply: assistantReply,
+              metadata: { state: currentState, extractedData, quickReplies: activeQuickReplies },
+            };
+          }
+
+          extractedData.verticalAttributes = {
+            ...(extractedData.verticalAttributes || {}),
+            [activeQuestion.key]: validation.normalizedValue,
+          };
+        }
+
+        const transition = await this.resolveStage1Transition({
+          verticalSlug: lead.verticalSlug,
+          verticalMeta,
+          businesses,
+          extractedData,
+          istTimeStr,
+        });
+
+        currentState = transition.state;
+        assistantReply = transition.reply;
+        activeQuickReplies = transition.quickReplies;
+        lead.metadata = {
+          state: currentState,
+          extractedData,
+          uiComponentType: transition.uiComponentType,
+          uiPayload: transition.uiPayload,
+          quickReplies: activeQuickReplies,
+          invalidAttempts: 0,
+          lastPromptMeta: this.buildLastPromptMeta(
+            currentState,
+            activeQuickReplies,
+            transition.uiPayload,
+            transition.activeQualifierKey,
+          ),
+        };
+        await this.leadRepository.save(lead);
+        await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply, extractedData });
+        return {
+          sessionId,
+          reply: assistantReply,
+          metadata: {
+            state: currentState,
+            extractedData,
+            uiComponentType: transition.uiComponentType,
+            uiPayload: transition.uiPayload,
+            quickReplies: activeQuickReplies,
+          },
+        };
+      }
+
       case 'SERVICE_SELECTION': {
         extractedData.selectedService = userMessage.trim();
         currentState = 'CONTACT_PENDING';
@@ -1206,6 +1407,7 @@ export class ChatService {
         break;
       }
 
+      case 'EXPANSION_CAPTURE':
       case 'CALLBACK_CAPTURE':
       case 'CONTACT_PENDING': {
         activeQuickReplies = [];
@@ -1344,6 +1546,7 @@ export class ChatService {
 
     const nodes: CachedLocalityNode[] = rows.map((row) => ({
       name: row.name,
+      aliases: Array.isArray(row.aliases) ? row.aliases : [],
       parentCity: row.parentCity,
       postalCodes: Array.isArray(row.postalCodes) ? row.postalCodes : [],
     }));

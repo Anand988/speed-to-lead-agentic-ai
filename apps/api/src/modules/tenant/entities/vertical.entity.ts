@@ -1,5 +1,15 @@
 import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn } from 'typeorm';
 
+export interface VerticalQualifierQuestion {
+  key: string; // e.g., 'property_size', 'urgency'
+  prompt: string; // e.g., 'What is the size of your property?'
+  type: 'enum' | 'text' | 'number';
+  options?: string[]; // Quick replies for 'enum'
+  aliases?: Record<string, string>; // e.g., { '3 bhk': '3BHK', 'three bhk': '3BHK' }
+  required: boolean;
+  applicableIntents?: string[]; // Optional: ask only for specific intents; omit to ask for all
+}
+
 export interface VerticalMetadataConfig {
   requirementPlaceholder?: string;
   quickReplies?: string[];
@@ -13,6 +23,7 @@ export interface VerticalMetadataConfig {
     maxUnits: number;
     options: string[];
   };
+  qualifierQuestions?: VerticalQualifierQuestion[];
   serviceFilterKeywords?: Record<string, string[]>;
   expansionReplyTemplate?: string;
 }

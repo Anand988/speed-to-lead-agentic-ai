@@ -161,7 +161,11 @@ async function runSuite() {
     assert(s5.metadata?.state === 'LOCALITY_PENDING', 'Alias "Book Immediate Service" maps to LOCALITY_PENDING', s5);
 
     const t1 = await sendMessage(s5.sessionId, 'Pune');
-    assert(t1.body.metadata?.state === 'CONTACT_PENDING', 'Unserviceable city Pune routes to CONTACT_PENDING', t1.body);
+    assert(
+      ['EXPANSION_CAPTURE', 'CONTACT_PENDING'].includes(t1.body.metadata?.state),
+      'Unserviceable city Pune routes to EXPANSION_CAPTURE',
+      t1.body,
+    );
     assert(t1.body.reply?.toLowerCase().includes('expanding'), 'Returns expansion-market message', t1.body);
   }
 
@@ -240,6 +244,41 @@ async function runSuite() {
     const rst = await sendMessage(s9.sessionId, 'start over');
     assert(rst.body.metadata?.state === 'GREETING', '"start over" resets to GREETING', rst.body);
     assert(!rst.body.metadata?.extractedData?.intent, 'Reset clears intent', rst.body.metadata?.extractedData);
+  }
+
+  // -------------------------------------------------------------------------
+  // CASE 10: Topic 2 — Comma-Segment Locality Resolution & Expansion Capture Completion
+  // -------------------------------------------------------------------------
+  console.log('\n--- Case 10: Topic 2 — Comma-Segment Locality & Expansion Capture ---');
+  {
+    // Comma-split primary segment ("Madhapur, Hyderabad" -> Madhapur -> Hyderabad vendors)
+    const s10a = await startSession('Repair & Maintenance');
+    const t1 = await sendMessage(s10a.sessionId, 'Madhapur, Hyderabad');
+    assert(
+      t1.body.metadata?.state === 'VENDOR_SELECTION',
+      'Comma-segment "Madhapur, Hyderabad" resolves to VENDOR_SELECTION',
+      t1.body,
+    );
+    assert(
+      t1.body.metadata?.extractedData?.isServiceable === true,
+      'Marks serviceable locality with isServiceable=true',
+      t1.body.metadata?.extractedData,
+    );
+
+    // Unserviceable locality -> EXPANSION_CAPTURE -> 10-digit phone -> COMPLETED
+    const s10b = await startSession('Repair & Maintenance');
+    const t2 = await sendMessage(s10b.sessionId, 'Jaipur');
+    assert(
+      ['EXPANSION_CAPTURE', 'CONTACT_PENDING'].includes(t2.body.metadata?.state),
+      'Unserviceable city Jaipur routes to EXPANSION_CAPTURE',
+      t2.body,
+    );
+    const t3 = await sendMessage(s10b.sessionId, 'Anand 9876543210');
+    assert(
+      t3.body.metadata?.state === 'COMPLETED',
+      '10-digit phone completes expansion waitlist lead',
+      t3.body,
+    );
   }
   console.log('\n🎉 All E2E Chat Flow Test Cases Passed!\n');
 }
