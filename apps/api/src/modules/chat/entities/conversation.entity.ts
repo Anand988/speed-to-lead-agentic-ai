@@ -11,6 +11,11 @@ import {
 } from 'typeorm';
 import { Tenant } from '../../tenant/tenant.entity.js';
 import { Message } from '../entities/message.entity.js';
+import type {
+  ChatState,
+  CollectedData,
+  LastPromptMeta,
+} from '../chat-guard.types.js';
 
 @Entity('conversations')
 export class Conversation {
@@ -30,13 +35,27 @@ export class Conversation {
   @Column({ default: 'active' })
   status: string; // 'active', 'qualified', 'closed'
 
-  // 👉 Added to track which vertical/domain this session belongs to
   @Column({ name: 'vertical_slug', nullable: true })
   verticalSlug: string;
 
-  // 👉 Added to track the current wizard step index (prevents loops)
   @Column({ name: 'step_index', default: 1 })
   stepIndex: number;
+
+  // 👉 Topic 1: Deterministic funnel state machine
+  @Column({ type: 'varchar', length: 64, default: 'GREETING' })
+  state: ChatState;
+
+  // 👉 Topic 1: Structured verified data across turns
+  @Column({ name: 'collected_data', type: 'jsonb', default: () => "'{}'" })
+  collectedData: CollectedData;
+
+  // 👉 Topic 1: Per-step invalid attempt counter (3-strike recovery ladder)
+  @Column({ name: 'invalid_attempts', type: 'int', default: 0 })
+  invalidAttempts: number;
+
+  // 👉 Topic 1: Active step expected input, quick replies & candidate IDs
+  @Column({ name: 'last_prompt_meta', type: 'jsonb', nullable: true })
+  lastPromptMeta: LastPromptMeta | null;
 
   @Column({ type: 'jsonb', nullable: true })
   extractedLeadData: {

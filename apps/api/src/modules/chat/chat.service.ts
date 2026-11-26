@@ -13,6 +13,13 @@ import { VerticalPromptService } from '../consumer-chat/vertical-prompt.service.
 import { CANONICAL_INTENTS, normalizeIntent } from './chat-intents.constants.js';
 import { ChatCacheService } from './chat-cache.service.js';
 import { LocalityEntity } from '../tenant/entities/locality.entity.js';
+import { ChatGuardService } from './chat-guard.service.js';
+import type {
+  BacktrackTargetState,
+  ChatState,
+  CollectedData,
+  LastPromptMeta,
+} from './chat-guard.types.js';
 
 export interface CachedLocalityNode {
   name: string;
@@ -48,6 +55,7 @@ export class ChatService {
   private readonly logger = new Logger(ChatService.name);
 
   constructor(
+    private readonly chatGuardService: ChatGuardService,
     private readonly queueService: QueueService,
     private readonly deepSeekExtractorService: DeepSeekExtractorService,
     private readonly verticalPromptService: VerticalPromptService,
@@ -72,6 +80,82 @@ export class ChatService {
       .toLowerCase()
       .replace(/\s+/g, ' ')
       .trim();
+  }
+
+  private toGuardState(rawState: string): ChatState {
+    switch (rawState) {
+      case 'DISCOVERY':
+        return 'GREETING';
+      case 'SERVICE_SELECTION':
+        return 'BUSINESS_SERVICE_SELECTION';
+      case 'CONTACT_PENDING':
+        return 'CUSTOMER_DETAILS_PENDING';
+      default:
+        return rawState as ChatState;
+    }
+  }
+
+  private fromBacktrackTarget(target: BacktrackTargetState): string {
+    switch (target) {
+      case 'BUSINESS_SERVICE_SELECTION':
+        return 'SERVICE_SELECTION';
+      case 'CUSTOMER_DETAILS_PENDING':
+        return 'CONTACT_PENDING';
+      default:
+        return target;
+    }
+  }
+
+  private buildLastPromptMeta(
+    state: string,
+    quickReplies: string[] = [],
+    uiPayload?: any[],
+  ): LastPromptMeta {
+    const guardState = this.toGuardState(state);
+    const options =
+      guardState === 'VENDOR_SELECTION' && Array.isArray(uiPayload)
+        ? uiPayload.map((b) => ({ id: String(b.id), label: String(b.name) }))
+        : quickReplies.map((label) => ({ label }));
+
+    const expectedInputMap: Record<ChatState, LastPromptMeta['expectedInput']> = {
+      GREETING: 'INTENT_OR_CLARIFICATION',
+      INTENT_CLARIFICATION: 'INTENT_OR_CLARIFICATION',
+      VERTICAL_QUALIFIER_PENDING: 'VERTICAL_QUALIFIER',
+      LOCALITY_PENDING: 'LOCALITY_OR_PIN',
+      EXPANSION_CAPTURE: 'CALLBACK_PHONE',
+      VENDOR_SELECTION: 'BUSINESS_SELECTION',
+      BUSINESS_SERVICE_SELECTION: 'SERVICE_SELECTION',
+      SLOT_SELECTION: 'SLOT_SELECTION',
+      CUSTOMER_DETAILS_PENDING: 'CUSTOMER_DETAILS',
+      AWAITING_BUSINESS_CONFIRMATION: 'NONE',
+      BUSINESS_PROPOSED_RESCHEDULE: 'SLOT_SELECTION',
+      OTP_VERIFICATION_PENDING: 'OTP_CODE',
+      CALLBACK_CAPTURE: 'CALLBACK_PHONE',
+      CONFIRMED: 'NONE',
+      COMPLETED: 'NONE',
+      CANCELLED: 'NONE',
+    };
+
+    return {
+      expectedInput: expectedInputMap[guardState] ?? 'NONE',
+      options,
+    };
+  }
+
+  private getVerticalDeterministicTerms(
+    metadata?: VerticalMetadataConfig | null,
+  ): string[] {
+    const terms: string[] = [...CANONICAL_INTENTS];
+    if (Array.isArray(metadata?.canonicalIntents)) {
+      terms.push(...metadata.canonicalIntents);
+    }
+    if (Array.isArray(metadata?.clarificationSubjects)) {
+      terms.push(...metadata.clarificationSubjects);
+    }
+    if (metadata?.intentAliases && typeof metadata.intentAliases === 'object') {
+      terms.push(...Object.keys(metadata.intentAliases));
+    }
+    return Array.from(new Set(terms.map((t) => String(t).trim()).filter(Boolean)));
   }
 
   private async getVerticalVendorsCached(verticalSlug: string): Promise<CachedVerticalVendors> {
@@ -575,22 +659,192 @@ export class ChatService {
     const lead = await this.leadRepository.findOne({ where: { sessionId } });
     if (!lead) throw new Error(`Session ${sessionId} not found`);
 
-    this.screenMessageForThreats(userMessage);
-
     const metadata = lead.metadata || {};
     let extractedData = metadata.extractedData || {};
-    let currentState = metadata.state || 'DISCOVERY';
+    let currentState: string = metadata.state || 'DISCOVERY';
+    let invalidAttempts: number = Number(metadata.invalidAttempts || 0);
     const istTimeStr = this.getIstTimestampString();
+
+    const [{ businesses, localities: dbLocalities }, vertical] = await Promise.all([
+      this.getVerticalVendorsCached(lead.verticalSlug),
+      this.getVerticalCached(lead.verticalSlug),
+    ]);
+    const verticalMeta = vertical?.metadata ?? null;
+    const verticalName = vertical?.name || lead.verticalSlug.replace(/-/g, ' ');
+
+    const effectiveGuardState: ChatState =
+      lead.status === LeadStatus.QUALIFIED
+        ? 'COMPLETED'
+        : this.toGuardState(currentState);
+
+    const lastPromptMeta: LastPromptMeta =
+      metadata.lastPromptMeta ||
+      this.buildLastPromptMeta(currentState, metadata.quickReplies, metadata.uiPayload);
+
+    // ------------------------------------------------------------------
+    // TOPIC 1: 4-Layer Per-Turn Guardrails (Layers 1–3 at 0 LLM tokens)
+    // ------------------------------------------------------------------
+    const guardDecision = this.chatGuardService.evaluateTurn({
+      rawMessage: userMessage,
+      state: effectiveGuardState,
+      collectedData: extractedData as CollectedData,
+      invalidAttempts,
+      lastPromptMeta,
+      verticalSlug: lead.verticalSlug,
+      verticalName,
+      verticalDeterministicTerms: this.getVerticalDeterministicTerms(verticalMeta),
+    });
+
+    if (guardDecision.action === 'BLOCK_SECURITY') {
+      throw new BadRequestException(guardDecision.message);
+    }
 
     await this.messageRepository.save({ sessionId, sender: 'visitor', content: userMessage });
 
-    let assistantReply = '';
-
-    if (currentState === 'COMPLETED' || lead.status === LeadStatus.QUALIFIED) {
-      assistantReply = `This session is already completed. How else can we assist you today?\n\n*(IST: ${istTimeStr})*`;
-      await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply });
-      return { sessionId, reply: assistantReply, metadata: { state: currentState, extractedData } };
+    if (guardDecision.action === 'BLOCK_TERMINAL') {
+      const reply = `${guardDecision.reply.message}\n\n*(IST: ${istTimeStr})*`;
+      await this.messageRepository.save({ sessionId, sender: 'assistant', content: reply });
+      return {
+        sessionId,
+        reply,
+        metadata: {
+          state: currentState,
+          extractedData,
+          quickReplies: guardDecision.reply.quickReplies ?? ['Start New Booking'],
+        },
+      };
     }
+
+    if (guardDecision.action === 'BLOCK_NSFW') {
+      const quickReplies = guardDecision.reply.quickReplies ?? metadata.quickReplies ?? [];
+      const reply = `${guardDecision.reply.message}\n\n*(IST: ${istTimeStr})*`;
+      await this.messageRepository.save({ sessionId, sender: 'assistant', content: reply });
+      return {
+        sessionId,
+        reply,
+        metadata: { ...metadata, state: currentState, extractedData, quickReplies },
+      };
+    }
+
+    if (guardDecision.action === 'NAV_RESET') {
+      const rootQuickReplies =
+        await this.verticalPromptService.getQuickRepliesForVertical(lead.verticalSlug);
+      currentState = 'GREETING';
+      extractedData = { tenantId: extractedData.tenantId };
+      invalidAttempts = 0;
+      const reply = `No problem—let's start fresh for **${verticalName}**. How can we assist you today?\n\n*(IST: ${istTimeStr})*`;
+      lead.metadata = {
+        state: currentState,
+        extractedData,
+        quickReplies: rootQuickReplies,
+        invalidAttempts,
+        lastPromptMeta: this.buildLastPromptMeta(currentState, rootQuickReplies),
+      };
+      await this.leadRepository.save(lead);
+      await this.messageRepository.save({ sessionId, sender: 'assistant', content: reply });
+      return {
+        sessionId,
+        reply,
+        metadata: { state: currentState, extractedData, quickReplies: rootQuickReplies },
+      };
+    }
+
+    if (guardDecision.action === 'NAV_BACKTRACK') {
+      currentState = this.fromBacktrackTarget(guardDecision.targetState);
+      extractedData = { ...(guardDecision.reply.updatedCollectedData || {}) };
+
+      if (guardDecision.targetState === 'LOCALITY_PENDING') {
+        delete extractedData.locality;
+        delete extractedData.selectedVendorId;
+        delete extractedData.selectedVendorName;
+        delete extractedData.selectedService;
+      } else if (guardDecision.targetState === 'VENDOR_SELECTION') {
+        delete extractedData.selectedVendorId;
+        delete extractedData.selectedVendorName;
+        delete extractedData.selectedService;
+      } else if (guardDecision.targetState === 'BUSINESS_SERVICE_SELECTION') {
+        delete extractedData.selectedService;
+      }
+
+      invalidAttempts = 0;
+      const promptMap: Record<string, string> = {
+        LOCALITY_PENDING: 'Sure—please enter your updated city, area, or PIN code:',
+        VENDOR_SELECTION: 'Sure—please select another provider from the list:',
+        SERVICE_SELECTION: 'Sure—please choose your preferred service package:',
+        SLOT_SELECTION: 'Sure—please select a new time slot:',
+        CONTACT_PENDING: 'Sure—please share your updated name and 10-digit mobile number:',
+      };
+      const reply = `${promptMap[currentState] ?? guardDecision.reply.message}\n\n*(IST: ${istTimeStr})*`;
+      const nextQuickReplies: string[] = [];
+      lead.metadata = {
+        state: currentState,
+        extractedData,
+        quickReplies: nextQuickReplies,
+        invalidAttempts,
+        lastPromptMeta: this.buildLastPromptMeta(currentState, nextQuickReplies),
+      };
+      await this.leadRepository.save(lead);
+      await this.messageRepository.save({ sessionId, sender: 'assistant', content: reply });
+      return {
+        sessionId,
+        reply,
+        metadata: { state: currentState, extractedData, quickReplies: nextQuickReplies },
+      };
+    }
+
+    if (
+      guardDecision.action === 'POSITIVE_MATCH' &&
+      guardDecision.matchedValue === 'REQUEST_CALLBACK'
+    ) {
+      currentState = 'CALLBACK_CAPTURE';
+      invalidAttempts = 0;
+      const reply = `Sure! Please share your 10-digit mobile number and our team will call you back shortly:\n\n*(IST: ${istTimeStr})*`;
+      lead.metadata = {
+        state: currentState,
+        extractedData,
+        quickReplies: [],
+        invalidAttempts,
+        lastPromptMeta: this.buildLastPromptMeta(currentState, []),
+      };
+      await this.leadRepository.save(lead);
+      await this.messageRepository.save({ sessionId, sender: 'assistant', content: reply });
+      return {
+        sessionId,
+        reply,
+        metadata: { state: currentState, extractedData, quickReplies: [] },
+      };
+    }
+
+    if (guardDecision.action === 'REJECT_GIBBERISH') {
+      invalidAttempts += 1;
+      const quickReplies = guardDecision.reply.quickReplies ?? metadata.quickReplies ?? [];
+      const reply = `${guardDecision.reply.message}\n\n*(IST: ${istTimeStr})*`;
+      lead.metadata = {
+        ...metadata,
+        state: currentState,
+        extractedData,
+        quickReplies,
+        invalidAttempts,
+        lastPromptMeta,
+      };
+      await this.leadRepository.save(lead);
+      await this.messageRepository.save({ sessionId, sender: 'assistant', content: reply });
+      return {
+        sessionId,
+        reply,
+        metadata: {
+          state: currentState,
+          extractedData,
+          quickReplies,
+          invalidAttempts,
+        },
+      };
+    }
+
+    // Valid turn proceeding into funnel -> reset invalidAttempts
+    invalidAttempts = 0;
+
+    let assistantReply = '';
 
     const phoneRegex = /\d{10}/;
     const phoneMatch = userMessage.match(phoneRegex);
@@ -605,7 +859,13 @@ export class ChatService {
 
       assistantReply = `Thank you, **${lead.firstName || 'Customer'}**! Your inquiry regarding *${extractedData.intent || 'Service Request'}* in **${extractedData.locality || 'your area'}** has been successfully registered. Our regional specialist will call you at ${lead.phone} shortly.\n\n*(IST: ${istTimeStr})*`;
 
-      lead.metadata = { state: currentState, extractedData, quickReplies: [] };
+      lead.metadata = {
+        state: currentState,
+        extractedData,
+        quickReplies: [],
+        invalidAttempts: 0,
+        lastPromptMeta: this.buildLastPromptMeta(currentState, []),
+      };
       await this.leadRepository.save(lead);
 
       try {
@@ -624,13 +884,6 @@ export class ChatService {
       await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply });
       return { sessionId, reply: assistantReply, metadata: { state: currentState, extractedData, quickReplies: [] } };
     }
-
-    const [{ businesses, localities: dbLocalities }, vertical] = await Promise.all([
-      this.getVerticalVendorsCached(lead.verticalSlug),
-      this.getVerticalCached(lead.verticalSlug),
-    ]);
-    const verticalMeta = vertical?.metadata ?? null;
-    const verticalName = vertical?.name || lead.verticalSlug.replace(/-/g, ' ');
 
     const previousSubject = extractedData.subject;
 
@@ -718,7 +971,15 @@ export class ChatService {
             currentState = 'VENDOR_SELECTION';
             assistantReply = `I found verified providers for **${extractedData.intent}** in **${extractedData.locality}**. Select a provider below or share your contact details:\n\n*(IST: ${istTimeStr})*`;
 
-            lead.metadata = { state: currentState, extractedData, uiComponentType: 'VENDOR_CARDS', uiPayload, quickReplies: [] };
+            lead.metadata = {
+              state: currentState,
+              extractedData,
+              uiComponentType: 'VENDOR_CARDS',
+              uiPayload,
+              quickReplies: [],
+              invalidAttempts: 0,
+              lastPromptMeta: this.buildLastPromptMeta(currentState, [], uiPayload),
+            };
             await this.leadRepository.save(lead);
             await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply, extractedData });
 
@@ -827,7 +1088,15 @@ export class ChatService {
             const uiPayload = matchingBusinesses;
             currentState = 'VENDOR_SELECTION';
             assistantReply = `Got it (**${combinedIntent}**). I found verified providers in **${extractedData.locality}**. Select a provider below:\n\n*(IST: ${istTimeStr})*`;
-            lead.metadata = { state: currentState, extractedData, uiComponentType: 'VENDOR_CARDS', uiPayload, quickReplies: [] };
+            lead.metadata = {
+              state: currentState,
+              extractedData,
+              uiComponentType: 'VENDOR_CARDS',
+              uiPayload,
+              quickReplies: [],
+              invalidAttempts: 0,
+              lastPromptMeta: this.buildLastPromptMeta(currentState, [], uiPayload),
+            };
             await this.leadRepository.save(lead);
             await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply, extractedData });
             return {
@@ -861,7 +1130,15 @@ export class ChatService {
           currentState = 'VENDOR_SELECTION';
           assistantReply = `I found verified providers for **${extractedData.intent || 'Service Request'}** in **${extractedData.locality}**. Select a provider below:\n\n*(IST: ${istTimeStr})*`;
 
-          lead.metadata = { state: currentState, extractedData, uiComponentType: 'VENDOR_CARDS', uiPayload, quickReplies: [] };
+          lead.metadata = {
+            state: currentState,
+            extractedData,
+            uiComponentType: 'VENDOR_CARDS',
+            uiPayload,
+            quickReplies: [],
+            invalidAttempts: 0,
+            lastPromptMeta: this.buildLastPromptMeta(currentState, [], uiPayload),
+          };
           await this.leadRepository.save(lead);
           await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply, extractedData });
 
@@ -929,6 +1206,7 @@ export class ChatService {
         break;
       }
 
+      case 'CALLBACK_CAPTURE':
       case 'CONTACT_PENDING': {
         activeQuickReplies = [];
         assistantReply = `Please share your full name and 10-digit mobile phone number so our specialist can finalize your request:\n\n*(IST: ${istTimeStr})*`;
@@ -943,7 +1221,13 @@ export class ChatService {
       }
     }
 
-    lead.metadata = { state: currentState, extractedData, quickReplies: activeQuickReplies };
+    lead.metadata = {
+      state: currentState,
+      extractedData,
+      quickReplies: activeQuickReplies,
+      invalidAttempts: 0,
+      lastPromptMeta: this.buildLastPromptMeta(currentState, activeQuickReplies),
+    };
     await this.leadRepository.save(lead);
     await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply });
 

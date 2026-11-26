@@ -3,6 +3,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ChatController } from './chat.controller.js';
 import { ChatService } from './chat.service.js';
+import { ChatGuardService } from './chat-guard.service.js';
 import { DeepSeekExtractorService } from './deepseek-extractor.service.js';
 import { VerticalPromptService } from '../consumer-chat/vertical-prompt.service.js';
 import { Lead } from '../lead/lead.entity.js';
@@ -16,16 +17,30 @@ import { LocalityEntity } from '../tenant/entities/locality.entity.js';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Lead, Message, VerticalEntity, BusinessEntity, ServiceEntity, LocalityEntity]),
+    TypeOrmModule.forFeature([
+      Lead,
+      Message,
+      VerticalEntity,
+      BusinessEntity,
+      ServiceEntity,
+      LocalityEntity,
+    ]),
     QueueModule,
   ],
   controllers: [ChatController],
   providers: [
     ChatService,
+    ChatGuardService,
     DeepSeekExtractorService,
     VerticalPromptService,
     ChatCacheService,
   ],
-  exports: [ChatService, DeepSeekExtractorService, VerticalPromptService, ChatCacheService],
+  exports: [
+    ChatService,
+    ChatGuardService,
+    DeepSeekExtractorService,
+    VerticalPromptService,
+    ChatCacheService,
+  ],
 })
 export class ChatModule {}
