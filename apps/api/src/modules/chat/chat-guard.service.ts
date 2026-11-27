@@ -61,6 +61,13 @@ const DIGIT_ALLOWED_STATES: ReadonlySet<ChatState> = new Set<ChatState>([
   'CALLBACK_CAPTURE',
 ]);
 
+const ORDINAL_SELECTION_STATES: ReadonlySet<ChatState> = new Set<ChatState>([
+  'VENDOR_SELECTION',
+  'BUSINESS_SERVICE_SELECTION',
+  'SLOT_SELECTION',
+  'INTENT_CLARIFICATION',
+]);
+
 const DEFAULT_STEP_EXAMPLES: Record<ChatState, string> = {
   GREETING: 'Tap one of the service options above or describe what you need.',
   INTENT_CLARIFICATION: 'Tap one of the clarified service options above.',
@@ -510,6 +517,14 @@ export class ChatGuardService {
     | 'G3_KEYBOARD_OR_CONSONANTS'
     | 'G4_UNEXPECTED_DIGITS'
     | null {
+    // Allow 1-based ordinal selections ("1", "2", "#1", "1.") in option-selection states
+    if (ORDINAL_SELECTION_STATES.has(state)) {
+      const normalizedOrdinal = trimmed.replace(/^[#\s]+|[.\)\s]+$/g, '');
+      if (/^[1-9]\d?$/.test(normalizedOrdinal)) {
+        return null;
+      }
+    }
+
     // G1: Empty / punctuation-only / single-character micro-noise
     const alnumOnly = trimmed.replace(/[^a-zA-Z0-9]/g, '');
     if (

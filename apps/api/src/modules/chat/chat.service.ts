@@ -21,6 +21,9 @@ import type {
   LastPromptMeta,
 } from './chat-guard.types.js';
 import { ChatStage1Service } from './chat-stage1.service.js';
+import { MoreThanOrEqual } from 'typeorm';
+import { Appointment } from '../appointments/appointment.entity.js';
+import { ChatStage2Service, Stage2SlotOption } from './chat-stage2.service.js';
 
 export interface CachedLocalityNode {
   name: string;
@@ -63,6 +66,9 @@ export class ChatService {
     private readonly deepSeekExtractorService: DeepSeekExtractorService,
     private readonly verticalPromptService: VerticalPromptService,
     private readonly chatCacheService: ChatCacheService,
+    @InjectRepository(Appointment)
+    private readonly appointmentRepository: Repository<Appointment>,
+    private readonly chatStage2Service: ChatStage2Service,
     @InjectRepository(Lead)
     private readonly leadRepository: Repository<Lead>,
     @InjectRepository(Message)
@@ -396,6 +402,7 @@ export class ChatService {
         'EXPANSION_CAPTURE',
         'VENDOR_SELECTION',
         'SERVICE_SELECTION',
+        'SLOT_SELECTION',
         'CONTACT_PENDING',
       ].includes(currentState)
     ) {
@@ -547,6 +554,68 @@ export class ChatService {
       return configured.map((o) => String(o).trim()).filter(Boolean);
     }
     return [...DEFAULT_PROPERTY_SIZE_OPTIONS];
+  }
+
+  private async buildSlotSelectionTransition(params: {
+    vendorId: string;
+    vendorName: string;
+    serviceName?: string;
+    durationMinutes?: number;
+    extractedData: any;
+    istTimeStr: string;
+  }): Promise<{
+    state: string;
+    reply: string;
+    quickReplies: string[];
+    uiComponentType?: string;
+    uiPayload?: Stage2SlotOption[];
+  }> {
+    const {
+      vendorId,
+      vendorName,
+      serviceName,
+      durationMinutes = 60,
+      extractedData,
+      istTimeStr,
+    } = params;
+
+    const now = new Date();
+    const existingAppointments = await this.appointmentRepository.find({
+      where: {
+        vendorId,
+        startTime: MoreThanOrEqual(now),
+      },
+      select: {
+        startTime: true,
+        status: true,
+      },
+    });
+
+    const slots = this.chatStage2Service.generateAvailableSlots({
+      now,
+      existingAppointments,
+      durationMinutes,
+      maxSlots: 6,
+    });
+
+    if (slots.length === 0) {
+      return {
+        state: 'CALLBACK_CAPTURE',
+        reply: `All immediate slots for **${vendorName}** are currently full. Please share your name and 10-digit mobile number for a priority callback to schedule a custom time:\n\n*(IST: ${istTimeStr})*`,
+        quickReplies: [],
+      };
+    }
+
+    extractedData.availableSlots = slots;
+    const serviceLabel = serviceName ? ` for **${serviceName}**` : '';
+
+    return {
+      state: 'SLOT_SELECTION',
+      reply: `Great! Choose an available time slot with **${vendorName}**${serviceLabel}:\n\n*(IST: ${istTimeStr})*`,
+      quickReplies: slots.map((s) => s.label),
+      uiComponentType: 'SLOT_CHIPS',
+      uiPayload: slots,
+    };
   }
 
   private buildClarificationActions(
@@ -1272,42 +1341,266 @@ export class ChatService {
       
 
       case 'VENDOR_SELECTION': {
-        const selectedVendorSummary =
-          businesses.find((b) => userMessage.toLowerCase().includes(b.name.toLowerCase())) ||
-          (metadata.uiPayload?.length === 1
-            ? businesses.find((b) => b.id === metadata.uiPayload[0].id)
-            : undefined);
+        const candidateVendors =
+          Array.isArray(metadata.uiPayload) && metadata.uiPayload.length > 0
+            ? metadata.uiPayload
+            : Array.isArray(metadata.quickReplies) && metadata.quickReplies.length > 0
+              ? metadata.quickReplies
+                  .map((name: string) =>
+                    businesses.find((b) => b.name.toLowerCase() === name.toLowerCase()),
+                  )
+                  .filter(Boolean)
+              : businesses;
 
-        const selectedVendor = selectedVendorSummary
-          ? await this.businessRepository.findOne({ where: { id: selectedVendorSummary.id } })
-          : null;
+        const matchedVendor = this.chatStage2Service.matchVendor(
+          userMessage,
+          candidateVendors,
+        );
 
-        if (selectedVendor) {
-          extractedData.selectedVendorId = selectedVendor.id;
-          extractedData.selectedVendorName = selectedVendor.name;
-
-          const vendorServices = await this.serviceRepository.find({
-            where: { businessId: selectedVendor.id } as any,
-          });
-
-          if (vendorServices.length > 0) {
-            (selectedVendor as any).services = vendorServices;
-            return this.processServiceOrContact(
-              lead.verticalSlug,
-              verticalName,
-              sessionId,
-              lead,
+        if (!matchedVendor) {
+          activeQuickReplies = [];
+          assistantReply = `Please select one of the listed providers (by clicking a card, typing their name, or entering a number like **1**):\n\n*(IST: ${istTimeStr})*`;
+          lead.metadata = {
+            state: 'VENDOR_SELECTION',
+            extractedData,
+            uiComponentType: 'VENDOR_CARDS',
+            uiPayload: candidateVendors,
+            quickReplies: [],
+            invalidAttempts: invalidAttempts + 1,
+            lastPromptMeta: this.buildLastPromptMeta(
+              'VENDOR_SELECTION',
+              [],
+              candidateVendors,
+            ),
+          };
+          await this.leadRepository.save(lead);
+          await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply });
+          return {
+            sessionId,
+            reply: assistantReply,
+            metadata: {
+              state: 'VENDOR_SELECTION',
               extractedData,
-              selectedVendor,
-              verticalMeta,
-            );
-          }
+              uiComponentType: 'VENDOR_CARDS',
+              uiPayload: candidateVendors,
+              quickReplies: [],
+            },
+          };
         }
 
+        extractedData.selectedVendorId = matchedVendor.id;
+        extractedData.selectedVendorName = matchedVendor.name;
+
+        const rawServices = await this.serviceRepository.find({
+          where: { businessId: matchedVendor.id },
+        });
+        const filteredServices = this.chatStage2Service.filterServicesForIntent(
+          rawServices,
+          extractedData.serviceIntent || extractedData.intent,
+          verticalMeta?.serviceFilterKeywords,
+        );
+
+        if (filteredServices.length > 0) {
+          extractedData.availableServices = filteredServices.map((s) => ({
+            id: s.id,
+            name: s.name,
+            basePrice: s.basePrice,
+          }));
+          currentState = 'SERVICE_SELECTION';
+          activeQuickReplies = filteredServices.map((s) =>
+            s.basePrice ? `${s.name} (₹${s.basePrice})` : s.name,
+          );
+          assistantReply = `You selected **${matchedVendor.name}**. Which service package would you like?\n\n*(IST: ${istTimeStr})*`;
+          lead.metadata = {
+            state: currentState,
+            extractedData,
+            quickReplies: activeQuickReplies,
+            invalidAttempts: 0,
+            lastPromptMeta: this.buildLastPromptMeta(currentState, activeQuickReplies),
+          };
+          await this.leadRepository.save(lead);
+          await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply, extractedData });
+          return {
+            sessionId,
+            reply: assistantReply,
+            metadata: { state: currentState, extractedData, quickReplies: activeQuickReplies },
+          };
+        }
+
+        // 0 services -> skip directly to SLOT_SELECTION
+        const slotTransition = await this.buildSlotSelectionTransition({
+          vendorId: matchedVendor.id,
+          vendorName: matchedVendor.name,
+          extractedData,
+          istTimeStr,
+        });
+
+        currentState = slotTransition.state;
+        assistantReply = slotTransition.reply;
+        activeQuickReplies = slotTransition.quickReplies;
+        lead.metadata = {
+          state: currentState,
+          extractedData,
+          uiComponentType: slotTransition.uiComponentType,
+          uiPayload: slotTransition.uiPayload,
+          quickReplies: activeQuickReplies,
+          invalidAttempts: 0,
+          lastPromptMeta: this.buildLastPromptMeta(
+            currentState,
+            activeQuickReplies,
+            slotTransition.uiPayload,
+          ),
+        };
+        await this.leadRepository.save(lead);
+        await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply, extractedData });
+        return {
+          sessionId,
+          reply: assistantReply,
+          metadata: {
+            state: currentState,
+            extractedData,
+            uiComponentType: slotTransition.uiComponentType,
+            uiPayload: slotTransition.uiPayload,
+            quickReplies: activeQuickReplies,
+          },
+        };
+      }
+
+      case 'SERVICE_SELECTION': {
+        const availableServices = Array.isArray(extractedData.availableServices)
+          ? extractedData.availableServices
+          : [];
+
+        const matchedService = this.chatStage2Service.matchService(
+          userMessage,
+          availableServices,
+        );
+
+        if (!matchedService) {
+          activeQuickReplies = availableServices.map((s: any) =>
+            s.basePrice ? `${s.name} (₹${s.basePrice})` : s.name,
+          );
+          assistantReply = `Please choose one of the available service packages (or type its number like **1**):\n\n*(IST: ${istTimeStr})*`;
+          lead.metadata = {
+            state: 'SERVICE_SELECTION',
+            extractedData,
+            quickReplies: activeQuickReplies,
+            invalidAttempts: invalidAttempts + 1,
+            lastPromptMeta: this.buildLastPromptMeta('SERVICE_SELECTION', activeQuickReplies),
+          };
+          await this.leadRepository.save(lead);
+          await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply });
+          return {
+            sessionId,
+            reply: assistantReply,
+            metadata: { state: 'SERVICE_SELECTION', extractedData, quickReplies: activeQuickReplies },
+          };
+        }
+
+        extractedData.selectedServiceId = matchedService.id;
+        extractedData.selectedService = matchedService.name;
+        extractedData.selectedServicePrice = matchedService.basePrice ?? null;
+        extractedData.selectedServiceDurationMinutes = matchedService.durationMinutes ?? 60;
+
+        const slotTransition = await this.buildSlotSelectionTransition({
+          vendorId: extractedData.selectedVendorId,
+          vendorName: extractedData.selectedVendorName || 'your provider',
+          serviceName: matchedService.name,
+          durationMinutes: extractedData.selectedServiceDurationMinutes,
+          extractedData,
+          istTimeStr,
+        });
+
+        currentState = slotTransition.state;
+        assistantReply = slotTransition.reply;
+        activeQuickReplies = slotTransition.quickReplies;
+        lead.metadata = {
+          state: currentState,
+          extractedData,
+          uiComponentType: slotTransition.uiComponentType,
+          uiPayload: slotTransition.uiPayload,
+          quickReplies: activeQuickReplies,
+          invalidAttempts: 0,
+          lastPromptMeta: this.buildLastPromptMeta(
+            currentState,
+            activeQuickReplies,
+            slotTransition.uiPayload,
+          ),
+        };
+        await this.leadRepository.save(lead);
+        await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply, extractedData });
+        return {
+          sessionId,
+          reply: assistantReply,
+          metadata: {
+            state: currentState,
+            extractedData,
+            uiComponentType: slotTransition.uiComponentType,
+            uiPayload: slotTransition.uiPayload,
+            quickReplies: activeQuickReplies,
+          },
+        };
+      }
+
+      case 'SLOT_SELECTION': {
+        const availableSlots: Stage2SlotOption[] = Array.isArray(extractedData.availableSlots)
+          ? extractedData.availableSlots
+          : [];
+
+        const matchedSlot = this.chatStage2Service.matchSlot(
+          userMessage,
+          availableSlots,
+        );
+
+        if (!matchedSlot) {
+          activeQuickReplies = availableSlots.map((s) => s.label);
+          assistantReply = `Please choose one of the available time slots (or type a number like **1**):\n\n*(IST: ${istTimeStr})*`;
+          lead.metadata = {
+            state: 'SLOT_SELECTION',
+            extractedData,
+            uiComponentType: 'SLOT_CHIPS',
+            uiPayload: availableSlots,
+            quickReplies: activeQuickReplies,
+            invalidAttempts: invalidAttempts + 1,
+            lastPromptMeta: this.buildLastPromptMeta(
+              'SLOT_SELECTION',
+              activeQuickReplies,
+              availableSlots,
+            ),
+          };
+          await this.leadRepository.save(lead);
+          await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply });
+          return {
+            sessionId,
+            reply: assistantReply,
+            metadata: {
+              state: 'SLOT_SELECTION',
+              extractedData,
+              uiComponentType: 'SLOT_CHIPS',
+              uiPayload: availableSlots,
+              quickReplies: activeQuickReplies,
+            },
+          };
+        }
+
+        extractedData.selectedSlot = matchedSlot;
         currentState = 'CONTACT_PENDING';
         activeQuickReplies = [];
-        assistantReply = `Please share your full name and 10-digit mobile phone number so our specialist can finalize your request:\n\n*(IST: ${istTimeStr})*`;
-        break;
+        assistantReply = `Slot reserved: **${matchedSlot.label}** with **${extractedData.selectedVendorName}**. Please share your full name and 10-digit mobile number to confirm your booking:\n\n*(IST: ${istTimeStr})*`;
+        lead.metadata = {
+          state: currentState,
+          extractedData,
+          quickReplies: [],
+          invalidAttempts: 0,
+          lastPromptMeta: this.buildLastPromptMeta(currentState, []),
+        };
+        await this.leadRepository.save(lead);
+        await this.messageRepository.save({ sessionId, sender: 'assistant', content: assistantReply, extractedData });
+        return {
+          sessionId,
+          reply: assistantReply,
+          metadata: { state: currentState, extractedData, quickReplies: [] },
+        };
       }
 
       case 'VERTICAL_QUALIFIER_PENDING': {
@@ -1397,14 +1690,6 @@ export class ChatService {
             quickReplies: activeQuickReplies,
           },
         };
-      }
-
-      case 'SERVICE_SELECTION': {
-        extractedData.selectedService = userMessage.trim();
-        currentState = 'CONTACT_PENDING';
-        activeQuickReplies = [];
-        assistantReply = `Great choice (**${extractedData.selectedService}**). Please share your full name and 10-digit mobile phone number so our specialist can confirm your booking:\n\n*(IST: ${istTimeStr})*`;
-        break;
       }
 
       case 'EXPANSION_CAPTURE':

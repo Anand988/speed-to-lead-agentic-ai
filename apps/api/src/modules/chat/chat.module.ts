@@ -15,6 +15,8 @@ import { QueueModule } from '../queue/queue.module.js';
 import { ChatCacheService } from './chat-cache.service.js';
 import { LocalityEntity } from '../tenant/entities/locality.entity.js';
 import { ChatStage1Service } from './chat-stage1.service.js';
+import { Appointment } from '../appointments/appointment.entity.js';
+import { ChatStage2Service } from './chat-stage2.service.js';
 
 @Module({
   imports: [
@@ -25,6 +27,7 @@ import { ChatStage1Service } from './chat-stage1.service.js';
       BusinessEntity,
       ServiceEntity,
       LocalityEntity,
+      Appointment,
     ]),
     QueueModule,
   ],
@@ -33,6 +36,7 @@ import { ChatStage1Service } from './chat-stage1.service.js';
     ChatService,
     ChatGuardService,
     ChatStage1Service,
+    ChatStage2Service,
     DeepSeekExtractorService,
     VerticalPromptService,
     ChatCacheService,
@@ -41,6 +45,7 @@ import { ChatStage1Service } from './chat-stage1.service.js';
     ChatService,
     ChatGuardService,
     ChatStage1Service,
+    ChatStage2Service,
     DeepSeekExtractorService,
     VerticalPromptService,
     ChatCacheService
